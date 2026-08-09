@@ -1,0 +1,25 @@
+# build output
+build/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.img
+
+# CubeMX
+.mxproject
+*.ioc.bak
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# claude code local settings (machine-specific paths)
+.claude/settings.local.json
