@@ -23,3 +23,11 @@ __pycache__/
 
 # claude code local settings (machine-specific paths)
 .claude/settings.local.json
+
+# CubeMX vendors all of CMSIS, but the build references only
+# CMSIS/Include, CMSIS/Device and the HAL driver. DSP/NN/RTOS2 are ~46 MB per
+# project of prebuilt math libs and examples -- verified a full clean build
+# passes without them. Kept on disk, excluded from the repo.
+**/Drivers/CMSIS/DSP/
+**/Drivers/CMSIS/NN/
+**/Drivers/CMSIS/RTOS2/
