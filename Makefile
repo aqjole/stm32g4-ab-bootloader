@@ -23,19 +23,25 @@ PACK    = python3 tools/pack.py
 
 VERSION ?= 0.1.0
 
-.PHONY: all bl app_a app_b images info sizes clean
+.PHONY: all check bl app_a app_b images info sizes clean
 
 all: images
 
-bl:
+# image_header.h, the three .ld files and pack.py each declare the memory map
+# independently, and nothing in the compiler or linker forces them to agree.
+# Run the cross-check before anything is built.
+check:
+	@python3 tools/check_map.py
+
+bl: check
 	$(MAKE_BL) LDSCRIPT=bl.ld
 
 # One source tree, two link addresses. Separate BUILD_DIR per variant so the
 # object files never collide -- they are compiled identically but linked apart.
-app_a:
+app_a: check
 	$(MAKE_APP) TARGET=app_a BUILD_DIR=build/a LDSCRIPT=app_a.ld
 
-app_b:
+app_b: check
 	$(MAKE_APP) TARGET=app_b BUILD_DIR=build/b LDSCRIPT=app_b.ld
 
 images: bl app_a app_b
