@@ -22,6 +22,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "image_header.h"
+#include "g4b_log.h"
+#include <stdarg.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,7 +61,66 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void g4b_printf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if (n > (int)sizeof buf) n = (int)sizeof buf;   /* vsnprintf returns would-be length */
+  HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
+}
 
+/* Hand control to the image in `slot_base`. Never returns. */
+__attribute__((noreturn))
+static void g4b_jump_to_slot(uint32_t slot_base)
+{
+  uint32_t app_base = slot_base + G4B_HDR_RESERVED;      /* skip the 512 B header */
+  uint32_t sp = *(volatile uint32_t *)(app_base + 0u);
+  uint32_t pc = *(volatile uint32_t *)(app_base + 4u);
+
+  g4b_printf("  sp 0x%08lX  pc 0x%08lX\r\n",
+             (unsigned long)sp, (unsigned long)pc);
+
+  if (sp < 0x20000000u || sp > 0x20008000u) {
+    g4b_printf("  refusing: sp not in SRAM -- slot looks empty\r\n");
+    while (1) { }
+  }
+
+  g4b_printf("jumping\r\n\r\n");
+  HAL_Delay(5);                       /* let the last byte leave the shift register */
+
+  __disable_irq();
+
+  HAL_RCC_DeInit();
+  HAL_DeInit();
+
+  SysTick->CTRL = 0u;
+  SysTick->LOAD = 0u;
+  SysTick->VAL  = 0u;
+
+  /* Disable AND unpend every source. A pending USART2 interrupt left over from
+     the bootloader would fire the instant interrupts come back on, vectoring
+     into an app handler whose peripheral is not initialised yet. */
+  for (uint32_t i = 0u; i < 8u; i++) {
+    NVIC->ICER[i] = 0xFFFFFFFFu;
+    NVIC->ICPR[i] = 0xFFFFFFFFu;
+  }
+
+  SCB->VTOR = app_base;
+  __DSB();
+  __ISB();
+  __enable_irq();
+
+  /* Set MSP and branch in one asm block: writing MSP invalidates every
+     stack-resident local, so `pc` must be pinned in a register across the
+     switch. __set_MSP() followed by a C call works at -Og and breaks at -O2. */
+  __asm volatile ("msr msp, %0 \n bx %1" :: "r" (sp), "r" (pc));
+
+  __builtin_unreachable();
+}
 /* USER CODE END 0 */
 
 /**
@@ -92,7 +154,9 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  g4b_printf("\r\n\r\nG4Boot bl 0.1.0  %s %s\r\n", __DATE__, __TIME__);
+  g4b_printf("booting slot A\r\n");
+  g4b_jump_to_slot(G4B_SLOT_A_BASE);
   /* USER CODE END 2 */
 
   /* Infinite loop */

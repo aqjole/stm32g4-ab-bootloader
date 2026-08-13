@@ -22,6 +22,7 @@
 #include "stm32g4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "g4b_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +52,18 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+void g4b_fault_report(uint32_t *frame)
+{
+  g4b_printf("\r\n*** HARDFAULT ***\r\n");
+  g4b_printf("  CFSR  0x%08lX  HFSR  0x%08lX\r\n",
+             (unsigned long)SCB->CFSR, (unsigned long)SCB->HFSR);
+  g4b_printf("  MMFAR 0x%08lX  BFAR  0x%08lX\r\n",
+             (unsigned long)SCB->MMFAR, (unsigned long)SCB->BFAR);
+  g4b_printf("  PC    0x%08lX  LR    0x%08lX  xPSR 0x%08lX\r\n",
+             (unsigned long)frame[6], (unsigned long)frame[5],
+             (unsigned long)frame[7]);
+  while (1) { }
+}
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -81,16 +93,18 @@ void NMI_Handler(void)
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+/* Naked so the exception frame is still exactly where the CPU left it: no
+   prologue has run, so MSP/PSP points straight at r0..xPSR. Picks the right
+   stack out of EXC_RETURN bit 2, then tail-calls the reporter with it in r0. */
+__attribute__((naked)) void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
-
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+  __asm volatile (
+    "tst   lr, #4            \n"
+    "ite   eq                \n"
+    "mrseq r0, msp           \n"
+    "mrsne r0, psp           \n"
+    "b     g4b_fault_report  \n"
+  );
 }
 
 /**

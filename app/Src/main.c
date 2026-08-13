@@ -22,6 +22,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "image_header.h"
+#include "g4b_log.h"
+#include <stdarg.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,7 +64,26 @@ static void MX_TIM2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void g4b_printf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if (n > (int)sizeof buf) n = (int)sizeof buf;   /* vsnprintf returns would-be length */
+  HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
+}
 
+/* Fires at 1 Hz from TIM2. A delay loop here would prove nothing about
+   interrupt delivery, which is the whole point of the exercise. */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2) {
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_8);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -72,7 +94,11 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* Assert our own vector table rather than inheriting whatever the bootloader
+     left in VTOR. g_pfnVectors comes from startup_stm32g431xx.s, so this is
+     correct in both slot variants with no per-slot #define. */
+  extern uint32_t g_pfnVectors;
+  SCB->VTOR = (uint32_t)&g_pfnVectors;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -96,7 +122,9 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  g4b_printf("G4Boot app 0.1.0  vtor 0x%08lX  %s %s\r\n",
+             (unsigned long)SCB->VTOR, __DATE__, __TIME__);
+  HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
