@@ -71,7 +71,7 @@ void g4b_printf(const char *fmt, ...)
   int n = vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
   if (n < 0) return;
-  if (n > (int)sizeof buf) n = (int)sizeof buf;   /* vsnprintf returns would-be length */
+  if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
   HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
 }
 
@@ -227,11 +227,20 @@ int main(void)
   g4b_crc_init();
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
+  
+  if (g4b_slot_valid(G4B_SLOT_A_BASE)) {
+    g4b_printf("booting slot A\r\n");
+    g4b_jump_to_slot(G4B_SLOT_A_BASE);
+  }
+  else if (g4b_slot_valid(G4B_SLOT_B_BASE)) {
+    g4b_printf("booting slot B\r\n");
+    g4b_jump_to_slot(G4B_SLOT_B_BASE);
+  }
+  else {
+    g4b_printf("no bootable image in either slot -- halting\r\n");
+    while (1) { }
+  }
 
-  (void)g4b_slot_valid(G4B_SLOT_A_BASE);
-
-  g4b_printf("booting slot A\r\n");
-  g4b_jump_to_slot(G4B_SLOT_A_BASE);
   /* USER CODE END 2 */
 
   /* Infinite loop */
