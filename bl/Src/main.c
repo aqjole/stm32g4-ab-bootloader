@@ -46,7 +46,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 /* Survives a warm reset -- app writes G4B_BOOT_MAGIC_STAY here and resets to
@@ -65,6 +64,17 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void g4b_tx_bytes(const uint8_t *p, uint32_t len)
+{
+  for (uint32_t i = 0u; i < len; i++) {
+    while ((USART2->ISR & USART_ISR_TXE) == 0u) { }
+    USART2->TDR = p[i];
+  }
+  /* Wait for the last byte to fully leave the shift register. Without this,
+     an ACK followed by NVIC_SystemReset() gets cut off mid-byte. */
+  while ((USART2->ISR & USART_ISR_TC) == 0u) { }
+}
+
 void g4b_printf(const char *fmt, ...)
 {
   char buf[160];
@@ -114,7 +124,7 @@ void g4b_printf(const char *fmt, ...)
   }
 
   va_end(ap);
-  HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)(p - buf), HAL_MAX_DELAY);
+  g4b_tx_bytes((const uint8_t *)buf, (uint32_t)(p - buf));
 }
 
 static void g4b_crc_init(void)
@@ -162,7 +172,7 @@ static void g4b_frame_send(uint8_t type, const void *payload, uint16_t len)
   g4b_tx[4u + len + 2u] = (uint8_t)(crc >> 16);
   g4b_tx[4u + len + 3u] = (uint8_t)(crc >> 24);
 
-  HAL_UART_Transmit(&huart2, g4b_tx, (uint16_t)(8u + len), HAL_MAX_DELAY);
+  g4b_tx_bytes(g4b_tx, 8u + len);
 }
 
 static uint8_t  g4b_rx[3u + G4B_MAX_PAYLOAD];
@@ -174,7 +184,17 @@ typedef enum { G4B_RX_OK, G4B_RX_TIMEOUT, G4B_RX_BAD } g4b_rx_result_t;
 
 static bool g4b_rx_byte(uint8_t *b, uint32_t ms)
 {
-  return HAL_UART_Receive(&huart2, b, 1u, ms) == HAL_OK;
+  uint32_t start = HAL_GetTick();
+  for (;;) {
+    if (USART2->ISR & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE)) {
+      USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
+    }
+    if (USART2->ISR & USART_ISR_RXNE) {
+      *b = (uint8_t)USART2->RDR;          /* reading RDR clears RXNE */
+      return true;
+    }
+    if ((HAL_GetTick() - start) >= ms) { return false; }
+  }
 }
 
 static uint32_t g4b_rx_dropped;   /* frames discarded during the last recv */
@@ -711,45 +731,24 @@ void SystemClock_Config(void)
   */
 static void MX_USART2_UART_Init(void)
 {
+  /* Direct register init: BRR + CR1 replace HAL_UART_Init and the ~3 KB it
+     anchors (UART_SetConfig, AdvFeatureConfig, uart_ex, PeriphCLKConfig).
+     Reset defaults already give 8N1, oversampling 16, no FIFO, and
+     USART2SEL = PCLK1, so only the non-defaults are written. */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_USART2_CLK_ENABLE();
 
-  /* USER CODE BEGIN USART2_Init 0 */
+  GPIO_InitTypeDef g = {
+    .Pin = USART2_TX_Pin | USART2_RX_Pin,
+    .Mode = GPIO_MODE_AF_PP,
+    .Pull = GPIO_NOPULL,
+    .Speed = GPIO_SPEED_FREQ_LOW,
+    .Alternate = GPIO_AF7_USART2,
+  };
+  HAL_GPIO_Init(GPIOA, &g);
 
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
+  USART2->BRR = (HAL_RCC_GetPCLK1Freq() + 115200u / 2u) / 115200u;
+  USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 }
 
 /**
