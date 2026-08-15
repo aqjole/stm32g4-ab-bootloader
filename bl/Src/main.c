@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdbool.h> 
 #include <stddef.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -169,6 +170,62 @@ static void g4b_state_dump(uint32_t page_base, const char *label)
              (unsigned)s->confirmed);
 }
 
+/* Erase `page_base` and program one boot state record into it.
+   Returns false on any flash error. */
+static bool g4b_state_write(uint32_t page_base, uint8_t active,
+                            uint8_t pending, uint8_t try_count,
+                            uint8_t confirmed, uint32_t seq)
+{
+  /* Erasing is destructive and a miscomputed page index lands on the
+     bootloader itself. Refuse anything that is not a state page. */
+  if (page_base != G4B_STATE0_BASE && page_base != G4B_STATE1_BASE) {
+    g4b_printf("refusing to erase 0x%08lX\r\n", (unsigned long)page_base);
+    return false;
+  }
+
+  boot_state_t rec;
+  rec.magic     = G4B_STATE_MAGIC;
+  rec.seq       = seq;
+  rec.active    = active;
+  rec.pending   = pending;
+  rec.try_count = try_count;
+  rec.confirmed = confirmed;
+  rec.crc32     = g4b_crc32(&rec, offsetof(boot_state_t, crc32));
+
+  uint64_t words[2];
+  memcpy(words, &rec, sizeof rec);
+
+  bool ok = true;
+  HAL_FLASH_Unlock();
+
+  FLASH_EraseInitTypeDef e = {
+    .TypeErase = FLASH_TYPEERASE_PAGES,
+    .Banks     = FLASH_BANK_1,
+    .Page      = (page_base - FLASH_BASE) / FLASH_PAGE_SIZE,  /* index, not address */
+    .NbPages   = 1u
+  };
+  uint32_t page_error = 0u;
+
+  if (HAL_FLASHEx_Erase(&e, &page_error) != HAL_OK) {
+    g4b_printf("erase failed, page %lu, err 0x%08lX\r\n",
+               (unsigned long)page_error, (unsigned long)HAL_FLASH_GetError());
+    ok = false;
+  }
+
+  for (uint32_t i = 0u; ok && i < 2u; i++) {
+    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                          page_base + i * 8u, words[i]) != HAL_OK) {
+      g4b_printf("program failed @0x%08lX, err 0x%08lX\r\n",
+                 (unsigned long)(page_base + i * 8u),
+                 (unsigned long)HAL_FLASH_GetError());
+      ok = false;
+    }
+  }
+
+  HAL_FLASH_Lock();   /* single exit point: locked on every path */
+  return ok;
+}
+
 static bool g4b_slot_valid(uint32_t slot_base)
 {
   /* Flash is memory-mapped: point a struct at the address and read it. */
@@ -299,6 +356,9 @@ int main(void)
   
   g4b_state_dump(G4B_STATE0_BASE, "state0");
   g4b_state_dump(G4B_STATE1_BASE, "state1");
+
+  g4b_state_write(G4B_STATE0_BASE, G4B_SLOT_A, G4B_SLOT_NONE, 0u, 1u, 1u);
+  g4b_state_dump(G4B_STATE0_BASE, "state0 after");
 
   if (g4b_slot_valid(G4B_SLOT_A_BASE)) {
     g4b_printf("booting slot A\r\n");
