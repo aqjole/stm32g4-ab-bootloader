@@ -24,7 +24,6 @@
 #include "image_header.h"
 #include "g4b_log.h"
 #include <stdarg.h>
-#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,13 +66,53 @@ static void MX_TIM2_Init(void);
 void g4b_printf(const char *fmt, ...)
 {
   char buf[160];
+  char *p = buf;
+  char *const end = buf + sizeof buf;
   va_list ap;
   va_start(ap, fmt);
-  int n = vsnprintf(buf, sizeof buf, fmt, ap);
+
+  for (const char *f = fmt; *f != '\0' && p < end; f++) {
+    if (*f != '%') { *p++ = *f; continue; }
+
+    f++;                                        /* past '%' */
+    unsigned pad = 0u;                          /* "08" -> 8; only zero-pad */
+    while (*f >= '0' && *f <= '9') { pad = pad * 10u + (unsigned)(*f - '0'); f++; }
+    while (*f == 'l' || *f == 'h') { f++; }     /* accept, ignore: all 32-bit */
+
+    char tmp[10];
+    unsigned n = 0u;
+    unsigned long v;
+
+    switch (*f) {
+    case 's': {
+      const char *s = va_arg(ap, const char *);
+      while (*s != '\0' && p < end) { *p++ = *s++; }
+      break;
+    }
+    case 'x':
+    case 'X': {
+      const char *digits = (*f == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+      v = va_arg(ap, unsigned long);
+      do { tmp[n++] = digits[v & 0xFuL]; v >>= 4; } while (v != 0uL && n < sizeof tmp);
+      while (n < pad && n < sizeof tmp) { tmp[n++] = '0'; }
+      while (n > 0u && p < end) { *p++ = tmp[--n]; }
+      break;
+    }
+    case 'u': {
+      v = va_arg(ap, unsigned long);
+      do { tmp[n++] = (char)('0' + (v % 10uL)); v /= 10uL; } while (v != 0uL && n < sizeof tmp);
+      while (n < pad && n < sizeof tmp) { tmp[n++] = '0'; }
+      while (n > 0u && p < end) { *p++ = tmp[--n]; }
+      break;
+    }
+    case '%':   *p++ = '%'; break;
+    case '\0':  f--;        break;              /* trailing '%': let the loop end */
+    default:    *p++ = *f;  break;              /* unknown: emit it literally */
+    }
+  }
+
   va_end(ap);
-  if (n < 0) return;
-  if (n > (int)sizeof buf) n = (int)sizeof buf;   /* vsnprintf returns would-be length */
-  HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)(p - buf), HAL_MAX_DELAY);
 }
 
 /* Fires at 1 Hz from TIM2. A delay loop here would prove nothing about
