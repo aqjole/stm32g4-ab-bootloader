@@ -31,3 +31,6 @@ __pycache__/
 **/Drivers/CMSIS/DSP/
 **/Drivers/CMSIS/NN/
 **/Drivers/CMSIS/RTOS2/
+
+# python virtualenv for the host tools
+.venv/

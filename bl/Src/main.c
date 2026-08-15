@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "image_header.h"
+#include "g4b_proto.h"
 #include "g4b_log.h"
 #include <stdarg.h>
 #include <stdbool.h> 
@@ -141,22 +142,89 @@ static uint32_t g4b_crc32(const void *data, uint32_t len)
   return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
 }
 
-static void g4b_rx_window(uint32_t ms)
+static uint8_t g4b_tx[G4B_MAX_PAYLOAD + G4B_FRAME_OVERHEAD];
+
+static void g4b_frame_send(uint8_t type, const void *payload, uint16_t len)
 {
-  uint32_t start = HAL_GetTick();
-  uint32_t count = 0u;
+  g4b_tx[0] = G4B_SOF;
+  g4b_tx[1] = (uint8_t)(len & 0xFFu);
+  g4b_tx[2] = (uint8_t)(len >> 8);
+  g4b_tx[3] = type;
 
-  g4b_printf("rx window %lu ms -- type something\r\n", (unsigned long)ms);
-
-  while ((HAL_GetTick() - start) < ms) {
-    uint8_t b;
-    if (HAL_UART_Receive(&huart2, &b, 1u, 10u) == HAL_OK) {
-      g4b_printf("  rx 0x%02lX\r\n", (unsigned long)b);
-      count++;
-    }
+  if (len > 0u && payload != NULL) {
+    memcpy(&g4b_tx[4], payload, len);
   }
 
-  g4b_printf("window closed, %lu bytes\r\n", (unsigned long)count);
+  /* CRC over len + type + payload, i.e. everything after the SOF */
+  uint32_t crc = g4b_crc32(&g4b_tx[1], 3u + len);
+  g4b_tx[4u + len + 0u] = (uint8_t)(crc);
+  g4b_tx[4u + len + 1u] = (uint8_t)(crc >> 8);
+  g4b_tx[4u + len + 2u] = (uint8_t)(crc >> 16);
+  g4b_tx[4u + len + 3u] = (uint8_t)(crc >> 24);
+
+  HAL_UART_Transmit(&huart2, g4b_tx, (uint16_t)(8u + len), HAL_MAX_DELAY);
+}
+
+static uint8_t  g4b_rx[3u + G4B_MAX_PAYLOAD];
+static uint16_t g4b_rx_len;
+static uint8_t  g4b_rx_type;
+#define G4B_RX_PAYLOAD (&g4b_rx[3])
+
+typedef enum { G4B_RX_OK, G4B_RX_TIMEOUT, G4B_RX_BAD } g4b_rx_result_t;
+
+static bool g4b_rx_byte(uint8_t *b, uint32_t ms)
+{
+  return HAL_UART_Receive(&huart2, b, 1u, ms) == HAL_OK;
+}
+
+static uint32_t g4b_rx_dropped;   /* frames discarded during the last recv */
+
+static g4b_rx_result_t g4b_frame_recv(uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+  g4b_rx_dropped = 0u;
+
+  while ((HAL_GetTick() - start) < timeout_ms) {
+    uint8_t b;
+
+    /* 1. Hunt for SOF. */
+    if (!g4b_rx_byte(&b, 10u) || b != G4B_SOF) { continue; }
+
+    /* 2. Header. */
+    bool got = true;
+    for (uint32_t i = 0u; i < 3u && got; i++) {
+      got = g4b_rx_byte(&g4b_rx[i], 50u);
+    }
+    if (!got) { g4b_rx_dropped++; continue; }
+
+    uint16_t len = (uint16_t)g4b_rx[0] | ((uint16_t)g4b_rx[1] << 8);
+
+    if (len > G4B_MAX_PAYLOAD) { g4b_rx_dropped++; continue; }
+
+    /* 3. Payload. */
+    for (uint16_t i = 0u; i < len && got; i++) {
+      got = g4b_rx_byte(&g4b_rx[3u + i], 50u);
+    }
+    if (!got) { g4b_rx_dropped++; continue; }
+
+    /* 4. CRC. */
+    uint8_t c[4];
+    for (uint32_t i = 0u; i < 4u && got; i++) {
+      got = g4b_rx_byte(&c[i], 50u);
+    }
+    if (!got) { g4b_rx_dropped++; continue; }
+
+    uint32_t want = (uint32_t)c[0] | ((uint32_t)c[1] << 8)
+                  | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24);
+
+    if (g4b_crc32(g4b_rx, 3u + len) != want) { g4b_rx_dropped++; continue; }
+
+    g4b_rx_len  = len;
+    g4b_rx_type = g4b_rx[2];
+    return G4B_RX_OK;
+  }
+
+  return (g4b_rx_dropped > 0u) ? G4B_RX_BAD : G4B_RX_TIMEOUT;
 }
 
 /* Read and validate the record in `page_base`. */
@@ -416,7 +484,24 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
-  g4b_rx_window(3000u);
+  g4b_printf("listening for a frame (3 s)\r\n");
+  g4b_rx_result_t r = g4b_frame_recv(3000u);
+
+  if (r == G4B_RX_OK) {
+    g4b_printf("frame type 0x%02lX len %lu\r\n",
+               (unsigned long)g4b_rx_type, (unsigned long)g4b_rx_len);
+    if (g4b_rx_type == G4B_MSG_HELLO) {
+      g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+      g4b_printf("sent ACK\r\n");
+    } else {
+      uint8_t why = G4B_NACK_BAD_TYPE;
+      g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    }
+  } else if (r == G4B_RX_BAD) {
+    g4b_printf("bad frame -- dropped\r\n");
+  } else {
+    g4b_printf("no frame\r\n");
+  }
 
   boot_state_t st;
   uint32_t stale = G4B_STATE0_BASE;
