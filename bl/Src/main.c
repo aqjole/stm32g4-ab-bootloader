@@ -141,6 +141,24 @@ static uint32_t g4b_crc32(const void *data, uint32_t len)
   return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
 }
 
+static void g4b_rx_window(uint32_t ms)
+{
+  uint32_t start = HAL_GetTick();
+  uint32_t count = 0u;
+
+  g4b_printf("rx window %lu ms -- type something\r\n", (unsigned long)ms);
+
+  while ((HAL_GetTick() - start) < ms) {
+    uint8_t b;
+    if (HAL_UART_Receive(&huart2, &b, 1u, 10u) == HAL_OK) {
+      g4b_printf("  rx 0x%02lX\r\n", (unsigned long)b);
+      count++;
+    }
+  }
+
+  g4b_printf("window closed, %lu bytes\r\n", (unsigned long)count);
+}
+
 /* Read and validate the record in `page_base`. */
 static bool g4b_state_read(uint32_t page_base, boot_state_t *out)
 {
@@ -398,6 +416,8 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
+  g4b_rx_window(3000u);
+
   boot_state_t st;
   uint32_t stale = G4B_STATE0_BASE;
 
