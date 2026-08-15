@@ -25,6 +25,7 @@
 #include "g4b_log.h"
 #include <stdarg.h>
 #include <stdbool.h> 
+#include <stddef.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -137,6 +138,35 @@ static void g4b_crc_init(void)
 static uint32_t g4b_crc32(const void *data, uint32_t len)
 {
   return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
+}
+
+static void g4b_state_dump(uint32_t page_base, const char *label)
+{
+  const boot_state_t *s = (const boot_state_t *)page_base;
+
+  g4b_printf("%s @0x%08lX: ", label, (unsigned long)page_base);
+
+  if (s->magic == 0xFFFFFFFFu) {
+    g4b_printf("erased\r\n");
+    return;
+  }
+
+  if (s->magic != G4B_STATE_MAGIC) {
+    g4b_printf("not a record (magic 0x%08lX)\r\n", (unsigned long)s->magic);
+    return;
+  }
+
+  uint32_t actual = g4b_crc32(s, offsetof(boot_state_t, crc32));
+  if (actual != s->crc32) {
+    g4b_printf("crc bad (stored 0x%08lX, computed 0x%08lX)\r\n",
+               (unsigned long)s->crc32, (unsigned long)actual);
+    return;
+  }
+
+  g4b_printf("seq %lu active %u pending %u try %u confirmed %u\r\n",
+             (unsigned long)s->seq, (unsigned)s->active,
+             (unsigned)s->pending, (unsigned)s->try_count,
+             (unsigned)s->confirmed);
 }
 
 static bool g4b_slot_valid(uint32_t slot_base)
@@ -267,6 +297,9 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
+  g4b_state_dump(G4B_STATE0_BASE, "state0");
+  g4b_state_dump(G4B_STATE1_BASE, "state1");
+
   if (g4b_slot_valid(G4B_SLOT_A_BASE)) {
     g4b_printf("booting slot A\r\n");
     g4b_jump_to_slot(G4B_SLOT_A_BASE);

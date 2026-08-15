@@ -110,4 +110,31 @@ _Static_assert(sizeof(image_header_t) == 32,
  */
 #define G4B_BOOT_MAGIC_STAY   0xB0071BADu
 
+/* ------------------------------------------------------------------ */
+/* Boot state record                                                  */
+/* ------------------------------------------------------------------ */
+/*
+ * Lives in the two ping-pong pages. Flash must be erased before it can be
+ * written and an erase leaves 0xFF, so with a single page there is a window
+ * where a power cut destroys the only copy. Two pages: read both, take the
+ * valid one with the highest seq; to write, erase the OTHER page and write
+ * there with seq + 1. There is never an instant with zero valid records.
+ */
+
+#define G4B_STATE_MAGIC   0x54533447u   /* bytes 47 34 53 54 = "G4ST" */
+#define G4B_SLOT_NONE     0xFFu         /* "no pending slot" -- also the erased value */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;      /* G4B_STATE_MAGIC                          */
+    uint32_t seq;        /* higher wins; +1 on every write           */
+    uint8_t  active;     /* G4B_SLOT_A or G4B_SLOT_B                 */
+    uint8_t  pending;    /* slot on trial, or G4B_SLOT_NONE          */
+    uint8_t  try_count;  /* boot attempts left for pending           */
+    uint8_t  confirmed;  /* 1 once the running image has reported in */
+    uint32_t crc32;      /* zlib CRC-32 over the 12 bytes above      */
+} boot_state_t;
+
+_Static_assert(sizeof(boot_state_t) == 16,
+               "boot_state_t must be 16 bytes - two doublewords");
+
 #endif /* IMAGE_HEADER_H */
