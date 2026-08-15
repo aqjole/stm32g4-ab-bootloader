@@ -25,6 +25,7 @@
 #include "g4b_log.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdbool.h> 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,6 +98,47 @@ static void g4b_crc_init(void)
 static uint32_t g4b_crc32(const void *data, uint32_t len)
 {
   return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
+}
+
+static bool g4b_slot_valid(uint32_t slot_base)
+{
+  /* Flash is memory-mapped: point a struct at the address and read it. */
+  const image_header_t *h = (const image_header_t *)slot_base;
+
+  g4b_printf("slot @0x%08lX: ", (unsigned long)slot_base);
+
+  if (h->magic != G4B_HDR_MAGIC) {
+    g4b_printf("no image (magic 0x%08lX)\r\n", (unsigned long)h->magic);
+    return false;
+  }
+
+  if (h->hdr_version != G4B_HDR_VERSION) {
+    g4b_printf("header v%u, I speak v%u\r\n",
+               (unsigned)h->hdr_version, (unsigned)G4B_HDR_VERSION);
+    return false;
+  }
+
+  if (h->img_len == 0u || h->img_len > G4B_APP_MAX_SIZE || (h->img_len % 8u) != 0u) {
+    g4b_printf("bad length %lu\r\n", (unsigned long)h->img_len);
+    return false;
+  }
+
+  const void *payload = (const void *)(slot_base + G4B_HDR_RESERVED);
+  uint32_t actual = g4b_crc32(payload, h->img_len);
+
+  if (actual != h->crc32) {
+    g4b_printf("CRC mismatch: header 0x%08lX, flash 0x%08lX\r\n",
+               (unsigned long)h->crc32, (unsigned long)actual);
+    return false;
+  }
+
+  g4b_printf("valid, %lu B, v%lu.%lu.%lu, crc 0x%08lX\r\n",
+             (unsigned long)h->img_len,
+             (unsigned long)G4B_VERSION_MAJOR(h->img_version),
+             (unsigned long)G4B_VERSION_MINOR(h->img_version),
+             (unsigned long)G4B_VERSION_PATCH(h->img_version),
+             (unsigned long)actual);
+  return true;
 }
 
 /* Hand control to the image in `slot_base`. Never returns. */
@@ -185,6 +227,8 @@ int main(void)
   g4b_crc_init();
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
+
+  (void)g4b_slot_valid(G4B_SLOT_A_BASE);
 
   g4b_printf("booting slot A\r\n");
   g4b_jump_to_slot(G4B_SLOT_A_BASE);
