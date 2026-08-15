@@ -319,9 +319,6 @@ static bool g4b_state_write(uint32_t page_base, uint8_t active,
   return ok;
 }
 
-/* Find the current record and the page that should be written next.
-   *stale_page is set on every path, including when no record exists yet --
-   the caller must never have to work out where to write. */
 static bool g4b_state_load(boot_state_t *out, uint32_t *stale_page)
 {
   boot_state_t s0, s1;
@@ -354,6 +351,95 @@ static bool g4b_state_load(boot_state_t *out, uint32_t *stale_page)
     *stale_page = G4B_STATE0_BASE;
   }
   return true;
+}
+
+static image_header_t g4b_up_hdr;    /* header the image must match at END  */
+static uint32_t       g4b_up_slot;   /* slot base being written             */
+static uint32_t       g4b_up_offset; /* payload bytes programmed so far     */
+static bool           g4b_up_open;   /* BEGIN accepted, chunks welcome      */
+
+static bool g4b_slot_erase(uint32_t slot_base)
+{
+  if (slot_base != G4B_SLOT_A_BASE && slot_base != G4B_SLOT_B_BASE) {
+    g4b_printf("refusing to erase 0x%08lX\r\n", (unsigned long)slot_base);
+    return false;
+  }
+
+  uint32_t first = (slot_base - FLASH_BASE) / FLASH_PAGE_SIZE;   /* 10 or 36 */
+  uint32_t pages = G4B_SLOT_SIZE / FLASH_PAGE_SIZE;              /* 26 */
+
+  g4b_printf("erasing %lu pages from %lu\r\n",
+             (unsigned long)pages, (unsigned long)first);
+
+  uint32_t t0 = HAL_GetTick();
+  HAL_FLASH_Unlock();
+
+  FLASH_EraseInitTypeDef e = {
+    .TypeErase = FLASH_TYPEERASE_PAGES,
+    .Banks     = FLASH_BANK_1,
+    .Page      = first,
+    .NbPages   = pages
+  };
+  uint32_t page_error = 0u;
+  bool ok = (HAL_FLASHEx_Erase(&e, &page_error) == HAL_OK);
+
+  if (!ok) {
+    g4b_printf("erase failed at page %lu err 0x%08lX\r\n",
+               (unsigned long)page_error, (unsigned long)HAL_FLASH_GetError());
+  }
+  HAL_FLASH_Lock();
+
+  g4b_printf("erase %s, %lu ms\r\n", ok ? "ok" : "FAILED",
+             (unsigned long)(HAL_GetTick() - t0));
+  return ok;
+}
+
+static void g4b_handle_begin(const boot_state_t *st)
+{
+  uint8_t why;
+
+  if (g4b_rx_len != sizeof(image_header_t)) {
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+  memcpy(&g4b_up_hdr, G4B_RX_PAYLOAD, sizeof g4b_up_hdr);
+
+  if (g4b_up_hdr.magic != G4B_HDR_MAGIC ||
+      g4b_up_hdr.hdr_version != G4B_HDR_VERSION) {
+    why = G4B_NACK_BAD_TYPE;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  if (g4b_up_hdr.img_len == 0u ||
+      g4b_up_hdr.img_len > G4B_APP_MAX_SIZE ||
+      (g4b_up_hdr.img_len % 8u) != 0u) {
+    g4b_printf("begin: bad length %lu\r\n", (unsigned long)g4b_up_hdr.img_len);
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  g4b_up_slot = (st->active == G4B_SLOT_B) ? G4B_SLOT_A_BASE : G4B_SLOT_B_BASE;
+
+  g4b_printf("begin: %lu B v%lu.%lu.%lu crc 0x%08lX -> slot %s\r\n",
+             (unsigned long)g4b_up_hdr.img_len,
+             (unsigned long)G4B_VERSION_MAJOR(g4b_up_hdr.img_version),
+             (unsigned long)G4B_VERSION_MINOR(g4b_up_hdr.img_version),
+             (unsigned long)G4B_VERSION_PATCH(g4b_up_hdr.img_version),
+             (unsigned long)g4b_up_hdr.crc32,
+             (g4b_up_slot == G4B_SLOT_B_BASE) ? "B" : "A");
+
+  if (!g4b_slot_erase(g4b_up_slot)) {
+    why = G4B_NACK_FLASH;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  g4b_up_offset = 0u;
+  g4b_up_open   = true;
+  g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
 }
 
 static bool g4b_slot_valid(uint32_t slot_base)
@@ -484,25 +570,6 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
-  g4b_printf("listening for a frame (3 s)\r\n");
-  g4b_rx_result_t r = g4b_frame_recv(3000u);
-
-  if (r == G4B_RX_OK) {
-    g4b_printf("frame type 0x%02lX len %lu\r\n",
-               (unsigned long)g4b_rx_type, (unsigned long)g4b_rx_len);
-    if (g4b_rx_type == G4B_MSG_HELLO) {
-      g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
-      g4b_printf("sent ACK\r\n");
-    } else {
-      uint8_t why = G4B_NACK_BAD_TYPE;
-      g4b_frame_send(G4B_MSG_NACK, &why, 1u);
-    }
-  } else if (r == G4B_RX_BAD) {
-    g4b_printf("bad frame -- dropped\r\n");
-  } else {
-    g4b_printf("no frame\r\n");
-  }
-
   boot_state_t st;
   uint32_t stale = G4B_STATE0_BASE;
 
@@ -518,6 +585,45 @@ int main(void)
                          st.try_count, st.confirmed, st.seq)) {
       g4b_printf("seed failed -- continuing on defaults\r\n");
     }
+  }
+
+  g4b_printf("listening for a frame (3 s)\r\n");
+  g4b_rx_result_t r = g4b_frame_recv(3000u);
+
+  if (r == G4B_RX_OK) {
+    g4b_printf("update mode -- not booting\r\n");
+
+    for (;;) {
+      g4b_printf("rx type 0x%02lX len %lu\r\n",
+                 (unsigned long)g4b_rx_type, (unsigned long)g4b_rx_len);
+
+      switch (g4b_rx_type) {
+      case G4B_MSG_HELLO:
+        g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+        break;
+
+      case G4B_MSG_BEGIN:
+        g4b_handle_begin(&st);
+        break;
+
+      default: {
+        uint8_t why = G4B_NACK_BAD_TYPE;
+        g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+        break;
+      }
+      }
+
+      if (g4b_frame_recv(30000u) != G4B_RX_OK) {
+        g4b_printf("host gone -- resetting\r\n");
+        NVIC_SystemReset();
+      }
+    }
+  }
+
+  if (r == G4B_RX_BAD) {
+    g4b_printf("bad frame -- dropped\r\n");
+  } else {
+    g4b_printf("no frame\r\n");
   }
 
   bool     want_b = (st.active == G4B_SLOT_B);
