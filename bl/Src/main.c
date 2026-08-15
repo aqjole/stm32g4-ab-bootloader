@@ -270,20 +270,6 @@ static bool g4b_state_load(boot_state_t *out, uint32_t *stale_page)
   return true;
 }
 
-static bool g4b_state_save(uint8_t active, uint8_t pending,
-                           uint8_t try_count, uint8_t confirmed)
-{
-  boot_state_t cur;
-  uint32_t stale = G4B_STATE0_BASE;
-  uint32_t next_seq = 1u;
-
-  if (g4b_state_load(&cur, &stale)) {
-    next_seq = cur.seq + 1u;
-  }
-
-  return g4b_state_write(stale, active, pending, try_count, confirmed, next_seq);
-}
-
 static bool g4b_slot_valid(uint32_t slot_base)
 {
   /* Flash is memory-mapped: point a struct at the address and read it. */
@@ -412,18 +398,36 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
-  /* TEMPORARY: save on every boot so seq advances and the pages alternate.
-     g4b_state_save calls g4b_state_load, which logs both pages. Removed once
-     slot selection is driven from the record. */
-  g4b_state_save(G4B_SLOT_A, G4B_SLOT_NONE, 0u, 1u);
+  boot_state_t st;
+  uint32_t stale = G4B_STATE0_BASE;
 
-  if (g4b_slot_valid(G4B_SLOT_A_BASE)) {
-    g4b_printf("booting slot A\r\n");
-    g4b_jump_to_slot(G4B_SLOT_A_BASE);
+  if (!g4b_state_load(&st, &stale)) {
+    g4b_printf("no state -- seeding active=A\r\n");
+    st.magic     = G4B_STATE_MAGIC;
+    st.seq       = 1u;
+    st.active    = G4B_SLOT_A;
+    st.pending   = G4B_SLOT_NONE;
+    st.try_count = 0u;
+    st.confirmed = 1u;
+    if (!g4b_state_write(stale, st.active, st.pending,
+                         st.try_count, st.confirmed, st.seq)) {
+      g4b_printf("seed failed -- continuing on defaults\r\n");
+    }
   }
-  else if (g4b_slot_valid(G4B_SLOT_B_BASE)) {
-    g4b_printf("booting slot B\r\n");
-    g4b_jump_to_slot(G4B_SLOT_B_BASE);
+
+  bool     want_b = (st.active == G4B_SLOT_B);
+  uint32_t first  = want_b ? G4B_SLOT_B_BASE : G4B_SLOT_A_BASE;
+  uint32_t second = want_b ? G4B_SLOT_A_BASE : G4B_SLOT_B_BASE;
+
+  g4b_printf("state says active=%s\r\n", want_b ? "B" : "A");
+
+  if (g4b_slot_valid(first)) {
+    g4b_printf("booting slot %s\r\n", want_b ? "B" : "A");
+    g4b_jump_to_slot(first);
+  }
+  else if (g4b_slot_valid(second)) {
+    g4b_printf("booting slot %s (fallback)\r\n", want_b ? "A" : "B");
+    g4b_jump_to_slot(second);
   }
   else {
     g4b_printf("no bootable image in either slot -- halting\r\n");
