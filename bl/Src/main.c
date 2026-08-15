@@ -141,33 +141,40 @@ static uint32_t g4b_crc32(const void *data, uint32_t len)
   return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
 }
 
-static void g4b_state_dump(uint32_t page_base, const char *label)
+/* Read and validate the record in `page_base`. */
+static bool g4b_state_read(uint32_t page_base, boot_state_t *out)
 {
   const boot_state_t *s = (const boot_state_t *)page_base;
 
-  g4b_printf("%s @0x%08lX: ", label, (unsigned long)page_base);
+  g4b_printf("state @0x%08lX: ", (unsigned long)page_base);
 
   if (s->magic == 0xFFFFFFFFu) {
     g4b_printf("erased\r\n");
-    return;
+    return false;
   }
 
   if (s->magic != G4B_STATE_MAGIC) {
     g4b_printf("not a record (magic 0x%08lX)\r\n", (unsigned long)s->magic);
-    return;
+    return false;
   }
 
   uint32_t actual = g4b_crc32(s, offsetof(boot_state_t, crc32));
   if (actual != s->crc32) {
     g4b_printf("crc bad (stored 0x%08lX, computed 0x%08lX)\r\n",
                (unsigned long)s->crc32, (unsigned long)actual);
-    return;
+    return false;
   }
 
   g4b_printf("seq %lu active %u pending %u try %u confirmed %u\r\n",
              (unsigned long)s->seq, (unsigned)s->active,
              (unsigned)s->pending, (unsigned)s->try_count,
              (unsigned)s->confirmed);
+
+  /* Copy out of flash into RAM so the caller holds a stable snapshot. */
+  if (out != NULL) {
+    memcpy(out, s, sizeof *out);
+  }
+  return true;
 }
 
 /* Erase `page_base` and program one boot state record into it.
@@ -224,6 +231,57 @@ static bool g4b_state_write(uint32_t page_base, uint8_t active,
 
   HAL_FLASH_Lock();   /* single exit point: locked on every path */
   return ok;
+}
+
+/* Find the current record and the page that should be written next.
+   *stale_page is set on every path, including when no record exists yet --
+   the caller must never have to work out where to write. */
+static bool g4b_state_load(boot_state_t *out, uint32_t *stale_page)
+{
+  boot_state_t s0, s1;
+
+  bool ok0 = g4b_state_read(G4B_STATE0_BASE, &s0);
+  bool ok1 = g4b_state_read(G4B_STATE1_BASE, &s1);
+
+  if (!ok0 && !ok1) {
+    *stale_page = G4B_STATE0_BASE;
+    return false;
+  }
+
+  if (ok0 && !ok1) {
+    *out = s0;
+    *stale_page = G4B_STATE1_BASE;
+    return true;
+  }
+
+  if (!ok0 && ok1) {
+    *out = s1;
+    *stale_page = G4B_STATE0_BASE;
+    return true;
+  }
+
+  if (s0.seq >= s1.seq) {
+    *out = s0;
+    *stale_page = G4B_STATE1_BASE;
+  } else {
+    *out = s1;
+    *stale_page = G4B_STATE0_BASE;
+  }
+  return true;
+}
+
+static bool g4b_state_save(uint8_t active, uint8_t pending,
+                           uint8_t try_count, uint8_t confirmed)
+{
+  boot_state_t cur;
+  uint32_t stale = G4B_STATE0_BASE;
+  uint32_t next_seq = 1u;
+
+  if (g4b_state_load(&cur, &stale)) {
+    next_seq = cur.seq + 1u;
+  }
+
+  return g4b_state_write(stale, active, pending, try_count, confirmed, next_seq);
 }
 
 static bool g4b_slot_valid(uint32_t slot_base)
@@ -354,11 +412,10 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
-  g4b_state_dump(G4B_STATE0_BASE, "state0");
-  g4b_state_dump(G4B_STATE1_BASE, "state1");
-
-  g4b_state_write(G4B_STATE0_BASE, G4B_SLOT_A, G4B_SLOT_NONE, 0u, 1u, 1u);
-  g4b_state_dump(G4B_STATE0_BASE, "state0 after");
+  /* TEMPORARY: save on every boot so seq advances and the pages alternate.
+     g4b_state_save calls g4b_state_load, which logs both pages. Removed once
+     slot selection is driven from the record. */
+  g4b_state_save(G4B_SLOT_A, G4B_SLOT_NONE, 0u, 1u);
 
   if (g4b_slot_valid(G4B_SLOT_A_BASE)) {
     g4b_printf("booting slot A\r\n");
