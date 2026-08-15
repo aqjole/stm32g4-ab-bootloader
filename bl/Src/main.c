@@ -49,6 +49,7 @@ UART_HandleTypeDef huart2;
 /* Survives a warm reset -- app writes G4B_BOOT_MAGIC_STAY here and resets to
    ask the bootloader to stay put. Same address in bl, app_a and app_b. */
 __attribute__((section(".noinit"))) uint32_t g4b_boot_request;
+CRC_HandleTypeDef hcrc;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -71,6 +72,31 @@ void g4b_printf(const char *fmt, ...)
   if (n < 0) return;
   if (n > (int)sizeof buf) n = (int)sizeof buf;   /* vsnprintf returns would-be length */
   HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
+}
+
+static void g4b_crc_init(void)
+{
+  /* HAL_CRC_MspInit is __weak and nothing defines it. Without this the peripheral is
+     unclocked: HAL_CRC_Init still returns HAL_OK and every result is garbage. */
+  __HAL_RCC_CRC_CLK_ENABLE();
+
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse    = DEFAULT_POLYNOMIAL_ENABLE;   /* 0x04C11DB7 */
+  hcrc.Init.DefaultInitValueUse     = DEFAULT_INIT_VALUE_ENABLE;   /* 0xFFFFFFFF */
+  hcrc.Init.InputDataInversionMode  = CRC_INPUTDATA_INVERSION_BYTE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_ENABLE;
+  hcrc.InputDataFormat              = CRC_INPUTDATA_FORMAT_BYTES;
+
+  if (HAL_CRC_Init(&hcrc) != HAL_OK) {
+    Error_Handler();
+  }
+}
+
+/* zlib-compatible CRC32. The hardware has no final-XOR stage, so that last
+   step of the standard is done here. */
+static uint32_t g4b_crc32(const void *data, uint32_t len)
+{
+  return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
 }
 
 /* Hand control to the image in `slot_base`. Never returns. */
@@ -155,6 +181,11 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   g4b_printf("\r\n\r\nG4Boot bl 0.1.0  %s %s\r\n", __DATE__, __TIME__);
+
+  g4b_crc_init();
+  uint32_t chk = g4b_crc32("123456789", 9u);
+  g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
+
   g4b_printf("booting slot A\r\n");
   g4b_jump_to_slot(G4B_SLOT_A_BASE);
   /* USER CODE END 2 */
