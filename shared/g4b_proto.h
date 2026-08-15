@@ -11,6 +11,7 @@
 
 #define G4B_SOF             0x7Eu
 #define G4B_MAX_PAYLOAD     256u
+#define G4B_CHUNK_DATA      248u    /* CHUNK payload: [seq u16 le][data]. Data must be a multiple of 8 for doubleword programming */
 #define G4B_FRAME_OVERHEAD  8u      /* SOF 1 + len 2 + type 1 + crc 4 */
 
 /* host -> device */

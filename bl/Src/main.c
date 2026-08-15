@@ -377,6 +377,7 @@ static image_header_t g4b_up_hdr;    /* header the image must match at END  */
 static uint32_t       g4b_up_slot;   /* slot base being written             */
 static uint32_t       g4b_up_offset; /* payload bytes programmed so far     */
 static bool           g4b_up_open;   /* BEGIN accepted, chunks welcome      */
+static uint16_t       g4b_up_seq;    /* next chunk we expect               */
 
 static bool g4b_slot_erase(uint32_t slot_base)
 {
@@ -411,6 +412,27 @@ static bool g4b_slot_erase(uint32_t slot_base)
 
   g4b_printf("erase %s, %lu ms\r\n", ok ? "ok" : "FAILED",
              (unsigned long)(HAL_GetTick() - t0));
+  return ok;
+}
+
+/* Program `len` bytes at `addr`, one doubleword at a time. `len` must be a
+   multiple of 8. */
+static bool g4b_flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
+{
+  bool ok = true;
+
+  HAL_FLASH_Unlock();
+  for (uint32_t i = 0u; i < len && ok; i += 8u) {
+    uint64_t dw;
+    memcpy(&dw, &data[i], 8u);   /* payload sits at g4b_rx[5]: unaligned */
+    ok = (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + i, dw) == HAL_OK);
+  }
+  HAL_FLASH_Lock();
+
+  if (!ok) {
+    g4b_printf("prog failed @0x%08lX err 0x%08lX\r\n",
+               (unsigned long)addr, (unsigned long)HAL_FLASH_GetError());
+  }
   return ok;
 }
 
@@ -458,7 +480,59 @@ static void g4b_handle_begin(const boot_state_t *st)
   }
 
   g4b_up_offset = 0u;
+  g4b_up_seq    = 0u;
   g4b_up_open   = true;
+  g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+}
+
+static void g4b_handle_chunk(void)
+{
+  uint8_t why;
+
+  if (!g4b_up_open) {
+    why = G4B_NACK_NOT_READY;                 /* no BEGIN, nowhere to write  */
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  /* seq(2) + at least one doubleword; data a multiple of 8, at most 248 */
+  uint32_t data_len = (g4b_rx_len >= 2u) ? (g4b_rx_len - 2u) : 0u;
+  if (data_len < 8u || data_len > G4B_CHUNK_DATA || (data_len % 8u) != 0u) {
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  uint16_t seq = (uint16_t)G4B_RX_PAYLOAD[0]
+               | (uint16_t)((uint16_t)G4B_RX_PAYLOAD[1] << 8);
+
+  /* Flash must not be touched twice (ECC); it only needs its receipt. */
+  if (g4b_up_seq > 0u && seq == g4b_up_seq - 1u) {
+    g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+    return;
+  }
+
+  uint32_t offset = (uint32_t)seq * G4B_CHUNK_DATA;
+
+  if (seq != g4b_up_seq ||
+      offset + data_len > G4B_HDR_RESERVED + g4b_up_hdr.img_len) {
+    g4b_printf("chunk: seq %lu want %lu\r\n",
+               (unsigned long)seq, (unsigned long)g4b_up_seq);
+    g4b_up_open = false;
+    why = G4B_NACK_BAD_SEQ;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  if (!g4b_flash_write(g4b_up_slot + offset, &G4B_RX_PAYLOAD[2], data_len)) {
+    g4b_up_open = false;
+    why = G4B_NACK_FLASH;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  g4b_up_seq++;
+  g4b_up_offset = offset + data_len;
   g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
 }
 
@@ -614,9 +688,6 @@ int main(void)
     g4b_printf("update mode -- not booting\r\n");
 
     for (;;) {
-      g4b_printf("rx type 0x%02lX len %lu\r\n",
-                 (unsigned long)g4b_rx_type, (unsigned long)g4b_rx_len);
-
       switch (g4b_rx_type) {
       case G4B_MSG_HELLO:
         g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
@@ -624,6 +695,10 @@ int main(void)
 
       case G4B_MSG_BEGIN:
         g4b_handle_begin(&st);
+        break;
+
+      case G4B_MSG_CHUNK:
+        g4b_handle_chunk();
         break;
 
       default: {
