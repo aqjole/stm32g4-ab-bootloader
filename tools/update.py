@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--dup", type=int, default=None,
                     help="resend this chunk once (device should just re-ACK)")
+    ap.add_argument("--stop-after", type=int, default=None,
+                    help="send only N chunks, then END -- device must NACK")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -51,7 +53,11 @@ def main():
             return 1
 
         t0 = time.monotonic()
+
         for seq in range(0, (len(img) + CHUNK_DATA - 1) // CHUNK_DATA):
+            if args.stop_after is not None and seq >= args.stop_after:
+                print("stopping early at chunk %d" % seq)
+                break
             data = img[seq * CHUNK_DATA:(seq + 1) * CHUNK_DATA]
 
             got = send_chunk(ser, seq, data)
@@ -71,10 +77,16 @@ def main():
                     return 1
 
         dt = time.monotonic() - t0
-        print("streamed %d bytes in %.2f s (%.0f B/s)"
-              % (len(img), dt, len(img) / dt))
-        return 0
+        print("streamed in %.2f s" % dt)
 
+        ser.write(fr.build(fr.MSG_END))
+        got = fr.read_frame(ser)
+        print("END  -> %s" % fr.describe(got))
+
+        ok = got is not None and got[0] == fr.MSG_ACK
+        if args.stop_after is not None:
+            return 0 if not ok else 1      # incomplete: NACK is the pass
+        return 0 if ok else 1
 
 if __name__ == "__main__":
     sys.exit(main())

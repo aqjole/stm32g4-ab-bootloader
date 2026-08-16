@@ -577,6 +577,48 @@ static bool g4b_slot_valid(uint32_t slot_base)
   return true;
 }
 
+static void g4b_handle_end(void)
+{
+  uint8_t why;
+
+  if (!g4b_up_open) {
+    why = G4B_NACK_NOT_READY;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+  g4b_up_open = false;
+
+  if (g4b_rx_len != 0u) {
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  uint32_t want = G4B_HDR_RESERVED + g4b_up_hdr.img_len;
+  if (g4b_up_offset != want) {
+    g4b_printf("end: got %lu of %lu B\r\n",
+               (unsigned long)g4b_up_offset, (unsigned long)want);
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  if (memcmp((const void *)g4b_up_slot, &g4b_up_hdr, sizeof g4b_up_hdr) != 0) {
+    why = G4B_NACK_BAD_CRC;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  /* Re-read from the memory-mapped slot and run the boot-time validation. */
+  if (!g4b_slot_valid(g4b_up_slot)) {
+    why = G4B_NACK_BAD_CRC;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+}
+
 /* Hand control to the image in `slot_base`. Never returns. */
 __attribute__((noreturn))
 static void g4b_jump_to_slot(uint32_t slot_base)
@@ -699,6 +741,10 @@ int main(void)
 
       case G4B_MSG_CHUNK:
         g4b_handle_chunk();
+        break;
+
+      case G4B_MSG_END:
+        g4b_handle_end();
         break;
 
       default: {
