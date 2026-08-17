@@ -165,7 +165,12 @@ int main(void)
   g4b_printf("G4Boot app 0.1.0  vtor 0x%08lX  %s %s\r\n",
              (unsigned long)SCB->VTOR, __DATE__, __TIME__);
   HAL_TIM_Base_Start_IT(&htim2);
-
+  
+  #ifdef G4B_SIMULATE_HANG
+    g4b_printf("simulating a hang: no kick, no confirm\r\n");
+    for (;;) { }
+  #endif
+  
   g4b_crc_init();
 
   boot_state_t st;
@@ -188,6 +193,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    IWDG->KR = 0xAAAAu;
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

@@ -75,6 +75,17 @@ static void g4b_tx_bytes(const uint8_t *p, uint32_t len)
   while ((USART2->ISR & USART_ISR_TC) == 0u) { }
 }
 
+/* Arm the independent watchdog: ~5 s at LSI/256. */
+static void g4b_iwdg_start(void)
+{
+  IWDG->KR  = 0xCCCCu;                    /* start the countdown            */
+  IWDG->KR  = 0x5555u;                    /* unlock PR/RLR                  */
+  IWDG->PR  = 6u;                         /* LSI/256 = 125 ticks per second */
+  IWDG->RLR = 624u;                       /* (624+1)/125 = 5.0 s            */
+  while (IWDG->SR != 0u) { }              /* wait for the writes to land    */
+  IWDG->KR  = 0xAAAAu;                    /* load the reload value          */
+}
+
 void g4b_printf(const char *fmt, ...)
 {
   char buf[160];
@@ -332,7 +343,7 @@ static void g4b_handle_begin(const boot_state_t *st)
     g4b_frame_send(G4B_MSG_NACK, &why, 1u);
     return;
   }
-  
+
   if (!g4b_slot_erase(g4b_up_slot)) {
     why = G4B_NACK_FLASH;
     g4b_frame_send(G4B_MSG_NACK, &why, 1u);
@@ -597,7 +608,15 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   g4b_printf("\r\n\r\nG4Boot bl 0.1.0  %s %s\r\n", __DATE__, __TIME__);
-
+  
+  uint32_t csr = RCC->CSR;
+  g4b_printf("reset cause:%s%s%s%s%s\r\n",
+              (csr & RCC_CSR_IWDGRSTF) ? " iwdg" : "",
+              (csr & RCC_CSR_SFTRSTF)  ? " soft" : "",
+              (csr & RCC_CSR_BORRSTF)  ? " bor"  : "",
+              (csr & RCC_CSR_OBLRSTF)  ? " obl"  : "",
+              (csr & RCC_CSR_PINRSTF)  ? " pin"  : "");
+  RCC->CSR = csr | RCC_CSR_RMVF;
   g4b_crc_init();
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
@@ -680,6 +699,7 @@ int main(void)
                           st.confirmed, st.seq + 1u)) {
         g4b_printf("trying pending %s, attempt %u of %u\r\n",
                    ps, (unsigned)(st.try_count + 1u), (unsigned)G4B_TRY_LIMIT);
+        g4b_iwdg_start();                 /* from here, confirm or die */
         g4b_jump_to_slot(g4b_slot_base(st.pending));
       }
     } else {
