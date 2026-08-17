@@ -123,6 +123,7 @@ _Static_assert(sizeof(image_header_t) == 32,
 
 #define G4B_STATE_MAGIC   0x54533447u   /* bytes 47 34 53 54 = "G4ST" */
 #define G4B_SLOT_NONE     0xFFu         /* "no pending slot" -- also the erased value */
+#define G4B_TRY_LIMIT     3u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;      /* G4B_STATE_MAGIC                          */

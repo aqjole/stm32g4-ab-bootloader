@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "image_header.h"
 #include "g4b_log.h"
+#include "g4b_state.h"
 #include <stdarg.h>
 /* USER CODE END Includes */
 
@@ -164,6 +165,23 @@ int main(void)
   g4b_printf("G4Boot app 0.1.0  vtor 0x%08lX  %s %s\r\n",
              (unsigned long)SCB->VTOR, __DATE__, __TIME__);
   HAL_TIM_Base_Start_IT(&htim2);
+
+  g4b_crc_init();
+
+  boot_state_t st;
+  uint32_t stale;
+  if (g4b_state_load(&st, &stale)) {
+    uint8_t me = (SCB->VTOR == G4B_SLOT_B_APP_BASE) ? G4B_SLOT_B : G4B_SLOT_A;
+
+    if (st.pending == me) {
+      /* Tentative boot. Healthy, for this bench app, means alive this long;
+         real firmware runs its own checks before vouching for itself. */
+      HAL_Delay(2000u);
+      if (g4b_state_write(stale, me, G4B_SLOT_NONE, 0u, 1u, st.seq + 1u)) {
+        g4b_printf("confirmed slot %s\r\n", (me == G4B_SLOT_B) ? "B" : "A");
+      }
+    }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */

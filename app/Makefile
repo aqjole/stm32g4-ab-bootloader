@@ -39,6 +39,9 @@ C_SOURCES =  \
 Src/main.c \
 Src/stm32g4xx_it.c \
 Src/stm32g4xx_hal_msp.c \
+../shared/g4b_state.c \
+Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_crc.c \
+Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_crc_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c \

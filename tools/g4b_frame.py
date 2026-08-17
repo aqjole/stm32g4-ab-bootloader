@@ -27,14 +27,16 @@ MSG_HELLO = 0x01
 MSG_BEGIN = 0x02
 MSG_CHUNK = 0x03
 MSG_END = 0x04
+MSG_BOOT = 0x05
 MSG_ACK = 0x80
 MSG_NACK = 0x81
 
 NAMES = {MSG_HELLO: "HELLO", MSG_BEGIN: "BEGIN", MSG_CHUNK: "CHUNK",
-         MSG_END: "END", MSG_ACK: "ACK", MSG_NACK: "NACK"}
+         MSG_END: "END", MSG_BOOT: "BOOT", MSG_ACK: "ACK", MSG_NACK: "NACK"}
 
 NACK_REASONS = {0x01: "bad crc", 0x02: "bad len", 0x03: "bad type",
-                0x04: "bad seq", 0x05: "flash error", 0x06: "not ready"}
+                0x04: "bad seq", 0x05: "flash error", 0x06: "not ready",
+                0x07: "wrong slot"}
 
 
 def build(msg_type, payload=b"", corrupt=False):

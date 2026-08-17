@@ -19,6 +19,7 @@
 #define G4B_MSG_BEGIN       0x02u
 #define G4B_MSG_CHUNK       0x03u
 #define G4B_MSG_END         0x04u
+#define G4B_MSG_BOOT        0x05u
 
 /* device -> host */
 #define G4B_MSG_ACK         0x80u
@@ -31,5 +32,6 @@
 #define G4B_NACK_BAD_SEQ    0x04u
 #define G4B_NACK_FLASH      0x05u
 #define G4B_NACK_NOT_READY  0x06u
+#define G4B_NACK_WRONG_SLOT 0x07u
 
 #endif /* G4B_PROTO_H */

@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "image_header.h"
 #include "g4b_proto.h"
+#include "g4b_state.h"
 #include "g4b_log.h"
 #include <stdarg.h>
 #include <stdbool.h> 
@@ -51,7 +52,6 @@
 /* Survives a warm reset -- app writes G4B_BOOT_MAGIC_STAY here and resets to
    ask the bootloader to stay put. Same address in bl, app_a and app_b. */
 __attribute__((section(".noinit"))) uint32_t g4b_boot_request;
-CRC_HandleTypeDef hcrc;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -125,31 +125,6 @@ void g4b_printf(const char *fmt, ...)
 
   va_end(ap);
   g4b_tx_bytes((const uint8_t *)buf, (uint32_t)(p - buf));
-}
-
-static void g4b_crc_init(void)
-{
-  /* HAL_CRC_MspInit is __weak and nothing defines it. Without this the peripheral is
-     unclocked: HAL_CRC_Init still returns HAL_OK and every result is garbage. */
-  __HAL_RCC_CRC_CLK_ENABLE();
-
-  hcrc.Instance = CRC;
-  hcrc.Init.DefaultPolynomialUse    = DEFAULT_POLYNOMIAL_ENABLE;   /* 0x04C11DB7 */
-  hcrc.Init.DefaultInitValueUse     = DEFAULT_INIT_VALUE_ENABLE;   /* 0xFFFFFFFF */
-  hcrc.Init.InputDataInversionMode  = CRC_INPUTDATA_INVERSION_BYTE;
-  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_ENABLE;
-  hcrc.InputDataFormat              = CRC_INPUTDATA_FORMAT_BYTES;
-
-  if (HAL_CRC_Init(&hcrc) != HAL_OK) {
-    Error_Handler();
-  }
-}
-
-/* zlib-compatible CRC32. The hardware has no final-XOR stage, so that last
-   step of the standard is done here. */
-static uint32_t g4b_crc32(const void *data, uint32_t len)
-{
-  return HAL_CRC_Calculate(&hcrc, (const uint32_t *)data, len) ^ 0xFFFFFFFFu;
 }
 
 static uint8_t g4b_tx[G4B_MAX_PAYLOAD + G4B_FRAME_OVERHEAD];
@@ -245,132 +220,6 @@ static g4b_rx_result_t g4b_frame_recv(uint32_t timeout_ms)
   }
 
   return (g4b_rx_dropped > 0u) ? G4B_RX_BAD : G4B_RX_TIMEOUT;
-}
-
-/* Read and validate the record in `page_base`. */
-static bool g4b_state_read(uint32_t page_base, boot_state_t *out)
-{
-  const boot_state_t *s = (const boot_state_t *)page_base;
-
-  g4b_printf("state @0x%08lX: ", (unsigned long)page_base);
-
-  if (s->magic == 0xFFFFFFFFu) {
-    g4b_printf("erased\r\n");
-    return false;
-  }
-
-  if (s->magic != G4B_STATE_MAGIC) {
-    g4b_printf("not a record (magic 0x%08lX)\r\n", (unsigned long)s->magic);
-    return false;
-  }
-
-  uint32_t actual = g4b_crc32(s, offsetof(boot_state_t, crc32));
-  if (actual != s->crc32) {
-    g4b_printf("crc bad (stored 0x%08lX, computed 0x%08lX)\r\n",
-               (unsigned long)s->crc32, (unsigned long)actual);
-    return false;
-  }
-
-  g4b_printf("seq %lu active %u pending %u try %u confirmed %u\r\n",
-             (unsigned long)s->seq, (unsigned)s->active,
-             (unsigned)s->pending, (unsigned)s->try_count,
-             (unsigned)s->confirmed);
-
-  /* Copy out of flash into RAM so the caller holds a stable snapshot. */
-  if (out != NULL) {
-    memcpy(out, s, sizeof *out);
-  }
-  return true;
-}
-
-/* Erase `page_base` and program one boot state record into it.
-   Returns false on any flash error. */
-static bool g4b_state_write(uint32_t page_base, uint8_t active,
-                            uint8_t pending, uint8_t try_count,
-                            uint8_t confirmed, uint32_t seq)
-{
-  /* Erasing is destructive and a miscomputed page index lands on the
-     bootloader itself. Refuse anything that is not a state page. */
-  if (page_base != G4B_STATE0_BASE && page_base != G4B_STATE1_BASE) {
-    g4b_printf("refusing to erase 0x%08lX\r\n", (unsigned long)page_base);
-    return false;
-  }
-
-  boot_state_t rec;
-  rec.magic     = G4B_STATE_MAGIC;
-  rec.seq       = seq;
-  rec.active    = active;
-  rec.pending   = pending;
-  rec.try_count = try_count;
-  rec.confirmed = confirmed;
-  rec.crc32     = g4b_crc32(&rec, offsetof(boot_state_t, crc32));
-
-  uint64_t words[2];
-  memcpy(words, &rec, sizeof rec);
-
-  bool ok = true;
-  HAL_FLASH_Unlock();
-
-  FLASH_EraseInitTypeDef e = {
-    .TypeErase = FLASH_TYPEERASE_PAGES,
-    .Banks     = FLASH_BANK_1,
-    .Page      = (page_base - FLASH_BASE) / FLASH_PAGE_SIZE,  /* index, not address */
-    .NbPages   = 1u
-  };
-  uint32_t page_error = 0u;
-
-  if (HAL_FLASHEx_Erase(&e, &page_error) != HAL_OK) {
-    g4b_printf("erase failed, page %lu, err 0x%08lX\r\n",
-               (unsigned long)page_error, (unsigned long)HAL_FLASH_GetError());
-    ok = false;
-  }
-
-  for (uint32_t i = 0u; ok && i < 2u; i++) {
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
-                          page_base + i * 8u, words[i]) != HAL_OK) {
-      g4b_printf("program failed @0x%08lX, err 0x%08lX\r\n",
-                 (unsigned long)(page_base + i * 8u),
-                 (unsigned long)HAL_FLASH_GetError());
-      ok = false;
-    }
-  }
-
-  HAL_FLASH_Lock();   /* single exit point: locked on every path */
-  return ok;
-}
-
-static bool g4b_state_load(boot_state_t *out, uint32_t *stale_page)
-{
-  boot_state_t s0, s1;
-
-  bool ok0 = g4b_state_read(G4B_STATE0_BASE, &s0);
-  bool ok1 = g4b_state_read(G4B_STATE1_BASE, &s1);
-
-  if (!ok0 && !ok1) {
-    *stale_page = G4B_STATE0_BASE;
-    return false;
-  }
-
-  if (ok0 && !ok1) {
-    *out = s0;
-    *stale_page = G4B_STATE1_BASE;
-    return true;
-  }
-
-  if (!ok0 && ok1) {
-    *out = s1;
-    *stale_page = G4B_STATE0_BASE;
-    return true;
-  }
-
-  if (s0.seq >= s1.seq) {
-    *out = s0;
-    *stale_page = G4B_STATE1_BASE;
-  } else {
-    *out = s1;
-    *stale_page = G4B_STATE0_BASE;
-  }
-  return true;
 }
 
 static image_header_t g4b_up_hdr;    /* header the image must match at END  */
@@ -473,6 +322,17 @@ static void g4b_handle_begin(const boot_state_t *st)
              (unsigned long)g4b_up_hdr.crc32,
              (g4b_up_slot == G4B_SLOT_B_BASE) ? "B" : "A");
 
+  if (g4b_up_hdr.entry < g4b_up_slot + G4B_HDR_RESERVED ||
+      g4b_up_hdr.entry >= g4b_up_slot + G4B_SLOT_SIZE ||
+      (g4b_up_hdr.entry & 1u) == 0u) {
+    g4b_printf("begin: entry 0x%08lX is not slot %s code -- wrong image?\r\n",
+               (unsigned long)g4b_up_hdr.entry,
+               (g4b_up_slot == G4B_SLOT_B_BASE) ? "B" : "A");
+    why = G4B_NACK_WRONG_SLOT;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+  
   if (!g4b_slot_erase(g4b_up_slot)) {
     why = G4B_NACK_FLASH;
     g4b_frame_send(G4B_MSG_NACK, &why, 1u);
@@ -559,6 +419,13 @@ static bool g4b_slot_valid(uint32_t slot_base)
     return false;
   }
 
+  if (h->entry < slot_base + G4B_HDR_RESERVED ||
+      h->entry >= slot_base + G4B_SLOT_SIZE ||
+      (h->entry & 1u) == 0u) {
+    g4b_printf("entry 0x%08lX not in this slot\r\n", (unsigned long)h->entry);
+    return false;
+  }
+
   const void *payload = (const void *)(slot_base + G4B_HDR_RESERVED);
   uint32_t actual = g4b_crc32(payload, h->img_len);
 
@@ -617,6 +484,35 @@ static void g4b_handle_end(void)
   }
 
   g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+}
+
+static void g4b_handle_boot(const boot_state_t *st, uint32_t stale)
+{
+  uint8_t why;
+  uint8_t target = (st->active == G4B_SLOT_B) ? G4B_SLOT_A : G4B_SLOT_B;
+
+  if (g4b_rx_len != 0u) {
+    why = G4B_NACK_BAD_LEN;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  if (!g4b_slot_valid(g4b_slot_base(target))) {
+    why = G4B_NACK_BAD_CRC;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  if (!g4b_state_write(stale, st->active, target, 0u,
+                       st->confirmed, st->seq + 1u)) {
+    why = G4B_NACK_FLASH;
+    g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+    return;
+  }
+
+  g4b_printf("pending=%s -- resetting\r\n", (target == G4B_SLOT_B) ? "B" : "A");
+  g4b_frame_send(G4B_MSG_ACK, NULL, 0u);   /* TC-wait guarantees it escapes */
+  NVIC_SystemReset();
 }
 
 /* Hand control to the image in `slot_base`. Never returns. */
@@ -745,6 +641,9 @@ int main(void)
 
       case G4B_MSG_END:
         g4b_handle_end();
+        break;      
+      case G4B_MSG_BOOT:
+        g4b_handle_boot(&st, stale);
         break;
 
       default: {
@@ -765,6 +664,29 @@ int main(void)
     g4b_printf("bad frame -- dropped\r\n");
   } else {
     g4b_printf("no frame\r\n");
+  }
+
+  if (st.pending != G4B_SLOT_NONE) {
+    const char *ps = (st.pending == G4B_SLOT_B) ? "B" : "A";
+
+    if (st.try_count >= G4B_TRY_LIMIT) {
+      g4b_printf("pending %s: %u tries, never confirmed -- rolling back\r\n",
+                 ps, (unsigned)st.try_count);
+      g4b_state_write(stale, st.active, G4B_SLOT_NONE, 0u,
+                      st.confirmed, st.seq + 1u);
+    } else if (g4b_slot_valid(g4b_slot_base(st.pending))) {
+      if (g4b_state_write(stale, st.active, st.pending,
+                          (uint8_t)(st.try_count + 1u),
+                          st.confirmed, st.seq + 1u)) {
+        g4b_printf("trying pending %s, attempt %u of %u\r\n",
+                   ps, (unsigned)(st.try_count + 1u), (unsigned)G4B_TRY_LIMIT);
+        g4b_jump_to_slot(g4b_slot_base(st.pending));
+      }
+    } else {
+      g4b_printf("pending %s invalid -- clearing\r\n", ps);
+      g4b_state_write(stale, st.active, G4B_SLOT_NONE, 0u,
+                      st.confirmed, st.seq + 1u);
+    }
   }
 
   bool     want_b = (st.active == G4B_SLOT_B);
