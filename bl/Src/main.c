@@ -52,12 +52,14 @@
 /* Survives a warm reset -- app writes G4B_BOOT_MAGIC_STAY here and resets to
    ask the bootloader to stay put. Same address in bl, app_a and app_b. */
 __attribute__((section(".noinit"))) uint32_t g4b_boot_request;
+static FDCAN_HandleTypeDef hfdcan1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_FDCAN1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -606,6 +608,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
   g4b_printf("\r\n\r\nG4Boot bl 0.1.0  %s %s\r\n", __DATE__, __TIME__);
   
@@ -621,6 +624,40 @@ int main(void)
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
   
+  /* fdcan loopback test -- temporary*/
+  {
+    FDCAN_TxHeaderTypeDef txh = {0};
+    uint8_t out[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+    txh.Identifier = 0x100u;
+    txh.IdType = FDCAN_STANDARD_ID;
+    txh.TxFrameType = FDCAN_DATA_FRAME;
+    txh.DataLength = FDCAN_DLC_BYTES_8;
+    txh.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    txh.BitRateSwitch = FDCAN_BRS_OFF;
+    txh.FDFormat = FDCAN_CLASSIC_CAN;
+    txh.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, out) == HAL_OK) {
+      g4b_printf("fdcan loopback: sent 8 bytes id 0x%X\r\n", txh.Identifier);
+    }
+
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0u &&
+           HAL_GetTick() - t0 < 100u) { }
+
+    FDCAN_RxHeaderTypeDef rxh;
+    uint8_t in[8] = {0};
+    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxh, in) == HAL_OK) {
+      g4b_printf("fdcan loopback: recv id 0x%X: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                 rxh.Identifier,
+                 in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
+      g4b_printf("fdcan loopback: %s\r\n",
+                 (memcmp(out, in, 8u) == 0) ? "match" : "MISMATCH");
+    } else {
+      g4b_printf("fdcan loopback: nothing received\r\n");
+    }
+  }
+
   boot_state_t st;
   uint32_t stale = G4B_STATE0_BASE;
 
@@ -812,6 +849,46 @@ static void MX_USART2_UART_Init(void)
 
   USART2->BRR = (HAL_RCC_GetPCLK1Freq() + 115200u / 2u) / 115200u;
   USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+static void MX_FDCAN1_Init(void)
+{
+  /* FDCANSEL resets to HSE, which this board does not have -- with the
+     default the peripheral has no clock and Init times out silently. */
+  __HAL_RCC_FDCAN_CONFIG(RCC_FDCANCLKSOURCE_PCLK1);
+  __HAL_RCC_FDCAN_CLK_ENABLE();
+
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  /* 500 kbit/s from 170 MHz PCLK1: /10 = 17 MHz tq, 34 tq/bit = 1+29+4 */
+  hfdcan1.Init.NominalPrescaler = 10u;
+  hfdcan1.Init.NominalSyncJumpWidth = 4u;
+  hfdcan1.Init.NominalTimeSeg1 = 29u;
+  hfdcan1.Init.NominalTimeSeg2 = 4u;
+  /* data-phase timing: unused in classic mode, must still be legal */
+  hfdcan1.Init.DataPrescaler = 5u;
+  hfdcan1.Init.DataSyncJumpWidth = 3u;
+  hfdcan1.Init.DataTimeSeg1 = 13u;
+  hfdcan1.Init.DataTimeSeg2 = 3u;
+  hfdcan1.Init.StdFiltersNbr = 0u;
+  hfdcan1.Init.ExtFiltersNbr = 0u;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
+    g4b_printf("fdcan init failed\r\n");
+    return;
+  }
+
+  /* no ID filters yet: every standard frame lands in RX FIFO 0 */
+  HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_ACCEPT_IN_RX_FIFO0,
+                               FDCAN_ACCEPT_IN_RX_FIFO0,
+                               FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
+  HAL_FDCAN_Start(&hfdcan1);
 }
 
 /**

@@ -57,6 +57,7 @@ Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cortex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_crc_ex.c \
 Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_crc.c \
+Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_fdcan.c \
 Src/system_stm32g4xx.c \
 Src/sysmem.c \
 Src/syscalls.c  
