@@ -77,6 +77,59 @@ static void g4b_tx_bytes(const uint8_t *p, uint32_t len)
   while ((USART2->ISR & USART_ISR_TC) == 0u) { }
 }
 
+/* --- CAN <-> byte-stream shim --------------------------------------------
+   Parcels in, bytes out. Logs stay UART-only. */
+#define G4B_CAN_ID_HOST2DEV  0x100u
+#define G4B_CAN_ID_DEV2HOST  0x101u
+
+/* 512 B cannot overflow: the host waits for an ACK after every protocol
+   frame (max 264 B). Indices are free-running u16 with wrap by mask; */
+static uint8_t  g4b_can_ring[512];
+static uint16_t g4b_can_head;
+static uint16_t g4b_can_tail;
+static bool     g4b_byte_was_can;   /* source of the last byte returned   */
+static bool     g4b_reply_via_can;  /* latched when a valid frame lands   */
+
+/* Drain the peripheral's 3-deep RX FIFO into the ring. */
+static void g4b_can_pump(void)
+{
+  FDCAN_RxHeaderTypeDef h;
+  uint8_t d[8];
+
+  while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0u) {
+    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, d) != HAL_OK) {
+      return;
+    }
+    if (h.Identifier != G4B_CAN_ID_HOST2DEV) { continue; }
+    for (uint32_t i = 0u; i < h.DataLength; i++) {
+      g4b_can_ring[g4b_can_head++ & 511u] = d[i];
+    }
+  }
+}
+
+static void g4b_can_tx_bytes(const uint8_t *p, uint32_t len)
+{
+  FDCAN_TxHeaderTypeDef h = {0};
+  h.Identifier = G4B_CAN_ID_DEV2HOST;
+  h.IdType = FDCAN_STANDARD_ID;
+  h.TxFrameType = FDCAN_DATA_FRAME;
+  h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  h.BitRateSwitch = FDCAN_BRS_OFF;
+  h.FDFormat = FDCAN_CLASSIC_CAN;
+  h.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+
+  while (len > 0u) {
+    uint32_t n = (len > 8u) ? 8u : len;
+    h.DataLength = n;
+    while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0u) { }
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, p) != HAL_OK) {
+      return;
+    }
+    p += n;
+    len -= n;
+  }
+}
+
 /* Arm the independent watchdog: ~5 s at LSI/256. */
 static void g4b_iwdg_start(void)
 {
@@ -160,7 +213,11 @@ static void g4b_frame_send(uint8_t type, const void *payload, uint16_t len)
   g4b_tx[4u + len + 2u] = (uint8_t)(crc >> 16);
   g4b_tx[4u + len + 3u] = (uint8_t)(crc >> 24);
 
-  g4b_tx_bytes(g4b_tx, 8u + len);
+  if (g4b_reply_via_can) {
+    g4b_can_tx_bytes(g4b_tx, 8u + len);
+  } else {
+    g4b_tx_bytes(g4b_tx, 8u + len);
+  }
 }
 
 static uint8_t  g4b_rx[3u + G4B_MAX_PAYLOAD];
@@ -179,6 +236,15 @@ static bool g4b_rx_byte(uint8_t *b, uint32_t ms)
     }
     if (USART2->ISR & USART_ISR_RXNE) {
       *b = (uint8_t)USART2->RDR;          /* reading RDR clears RXNE */
+      g4b_byte_was_can = false;
+      return true;
+    }
+
+    g4b_can_pump();
+
+    if (g4b_can_tail != g4b_can_head) {
+      *b = g4b_can_ring[g4b_can_tail++ & 511u];
+      g4b_byte_was_can = true;
       return true;
     }
     if ((HAL_GetTick() - start) >= ms) { return false; }
@@ -229,6 +295,7 @@ static g4b_rx_result_t g4b_frame_recv(uint32_t timeout_ms)
 
     g4b_rx_len  = len;
     g4b_rx_type = g4b_rx[2];
+    g4b_reply_via_can = g4b_byte_was_can;
     return G4B_RX_OK;
   }
 
@@ -623,41 +690,6 @@ int main(void)
   g4b_crc_init();
   uint32_t chk = g4b_crc32("123456789", 9u);
   g4b_printf("CRC32 check 0x%08lX (expect 0xCBF43926)\r\n", (unsigned long)chk);
-  
-  /* fdcan loopback test -- temporary*/
-  {
-    FDCAN_TxHeaderTypeDef txh = {0};
-    uint8_t out[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
-    txh.Identifier = 0x100u;
-    txh.IdType = FDCAN_STANDARD_ID;
-    txh.TxFrameType = FDCAN_DATA_FRAME;
-    txh.DataLength = FDCAN_DLC_BYTES_8;
-    txh.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    txh.BitRateSwitch = FDCAN_BRS_OFF;
-    txh.FDFormat = FDCAN_CLASSIC_CAN;
-    txh.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, out) == HAL_OK) {
-      g4b_printf("fdcan loopback: sent 8 bytes id 0x%X\r\n", txh.Identifier);
-      g4b_printf("fdcan bus: waiting 10 s for a frame from the PC...\r\n");
-    }
-
-    uint32_t t0 = HAL_GetTick();
-    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0u &&
-           HAL_GetTick() - t0 < 10000u) { }
-
-    FDCAN_RxHeaderTypeDef rxh;
-    uint8_t in[8] = {0};
-    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxh, in) == HAL_OK) {
-      g4b_printf("fdcan loopback: recv id 0x%X: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-                 rxh.Identifier,
-                 in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
-      g4b_printf("fdcan loopback: %s\r\n",
-                 (memcmp(out, in, 8u) == 0) ? "match" : "MISMATCH");
-    } else {
-      g4b_printf("fdcan loopback: nothing received\r\n");
-    }
-  }
 
   boot_state_t st;
   uint32_t stale = G4B_STATE0_BASE;

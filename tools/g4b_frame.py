@@ -91,3 +91,61 @@ def describe(got):
 
 def open_port(port, baud=115200, timeout=1.0):
     return serial.Serial(port, baud, timeout=timeout)
+
+
+CAN_ID_HOST2DEV = 0x100
+CAN_ID_DEV2HOST = 0x101
+
+
+class CanPipe:
+    """A python-can bus dressed as a pyserial port: read(n) / write(b).
+
+    The device-side shim, mirrored: bytes out ride 0x100 frames of up to
+    8 bytes; bytes in are the data of 0x101 frames, concatenated. read()
+    matches pyserial semantics -- waits up to `timeout`, may return fewer
+    than n bytes.
+    """
+
+    def __init__(self, channel, bitrate=500000, timeout=1.0):
+        try:
+            import can
+        except ImportError:
+            sys.exit("error: python-can missing. Run:\n"
+                     "  .venv/bin/pip install python-can")
+        self._can = can
+        self.bus = can.Bus(interface="slcan", channel=channel,
+                           bitrate=bitrate)
+        self.timeout = timeout
+        self._buf = bytearray()
+
+    def write(self, data):
+        for i in range(0, len(data), 8):
+            self.bus.send(self._can.Message(arbitration_id=CAN_ID_HOST2DEV,
+                                            data=data[i:i + 8],
+                                            is_extended_id=False))
+
+    def read(self, n=1):
+        import time
+        deadline = time.monotonic() + self.timeout
+        while len(self._buf) < n:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            msg = self.bus.recv(timeout=remaining)
+            if msg is None:
+                continue
+            if msg.arbitration_id == CAN_ID_DEV2HOST and not msg.is_error_frame:
+                self._buf.extend(msg.data)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.bus.shutdown()
+
+
+def open_can(channel, bitrate=500000, timeout=1.0):
+    return CanPipe(channel, bitrate, timeout)

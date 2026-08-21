@@ -27,9 +27,13 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--corrupt", action="store_true",
                     help="flip a CRC bit; the device should drop the frame")
+    ap.add_argument("--can", action="store_true",
+                    help="port is an slcan CAN adapter; speak over the bus")
     args = ap.parse_args()
 
-    with fr.open_port(args.port, args.baud) as ser:
+    opened = (fr.open_can(args.port) if args.can
+              else fr.open_port(args.port, args.baud))
+    with opened as ser:
         frame = fr.build(fr.MSG_HELLO, corrupt=args.corrupt)
         ser.write(frame)
         print("sent  HELLO%s  %s"
