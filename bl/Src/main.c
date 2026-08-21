@@ -639,11 +639,12 @@ int main(void)
 
     if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, out) == HAL_OK) {
       g4b_printf("fdcan loopback: sent 8 bytes id 0x%X\r\n", txh.Identifier);
+      g4b_printf("fdcan bus: waiting 10 s for a frame from the PC...\r\n");
     }
 
     uint32_t t0 = HAL_GetTick();
     while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0u &&
-           HAL_GetTick() - t0 < 100u) { }
+           HAL_GetTick() - t0 < 10000u) { }
 
     FDCAN_RxHeaderTypeDef rxh;
     uint8_t in[8] = {0};
@@ -846,7 +847,6 @@ static void MX_USART2_UART_Init(void)
     .Alternate = GPIO_AF7_USART2,
   };
   HAL_GPIO_Init(GPIOA, &g);
-
   USART2->BRR = (HAL_RCC_GetPCLK1Freq() + 115200u / 2u) / 115200u;
   USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
 }
@@ -858,10 +858,21 @@ static void MX_FDCAN1_Init(void)
   __HAL_RCC_FDCAN_CONFIG(RCC_FDCANCLKSOURCE_PCLK1);
   __HAL_RCC_FDCAN_CLK_ENABLE();
 
+  /* PA12 = FDCAN1_TX, PA11 = FDCAN1_RX */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  GPIO_InitTypeDef g = {
+    .Pin = GPIO_PIN_11 | GPIO_PIN_12,
+    .Mode = GPIO_MODE_AF_PP,
+    .Pull = GPIO_NOPULL,
+    .Speed = GPIO_SPEED_FREQ_HIGH,
+    .Alternate = GPIO_AF9_FDCAN1,
+  };
+  HAL_GPIO_Init(GPIOA, &g);
+
   hfdcan1.Instance = FDCAN1;
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
-  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
   hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
