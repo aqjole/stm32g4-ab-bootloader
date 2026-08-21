@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--timeout", type=float, default=10.0,
                     help="erasing 26 pages takes about a second; be generous")
+    ap.add_argument("--can", action="store_true",
+                    help="port is an slcan CAN adapter; speak over the bus")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -57,7 +59,9 @@ def main():
     show_header(hdr)
     print()
 
-    with fr.open_port(args.port, args.baud, timeout=args.timeout) as ser:
+    opened = (fr.open_can(args.port, timeout=args.timeout) if args.can
+              else fr.open_port(args.port, args.baud, timeout=args.timeout))
+    with opened as ser:
         ser.write(fr.build(fr.MSG_BEGIN, hdr))
         print("sent  BEGIN (%d B payload)" % len(hdr))
 

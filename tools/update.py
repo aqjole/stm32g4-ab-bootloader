@@ -40,6 +40,8 @@ def main():
                     help="send only N chunks, then END -- device must NACK")
     ap.add_argument("--boot", action="store_true",
                     help="after END ACKs, send BOOT: set pending and reset")
+    ap.add_argument("--can", action="store_true",
+                    help="port is an slcan CAN adapter; speak over the bus")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -47,7 +49,9 @@ def main():
     print("image %s: %d bytes = %d chunks"
           % (args.image, len(img), (len(img) + CHUNK_DATA - 1) // CHUNK_DATA))
 
-    with fr.open_port(args.port, args.baud, timeout=10.0) as ser:
+    opened = (fr.open_can(args.port, timeout=10.0) if args.can
+              else fr.open_port(args.port, args.baud, timeout=10.0))
+    with opened as ser:
         ser.write(fr.build(fr.MSG_BEGIN, img[:32]))
         got = fr.read_frame(ser)
         print("BEGIN -> %s" % fr.describe(got))
@@ -55,6 +59,7 @@ def main():
             return 1
 
         t0 = time.monotonic()
+        nbytes = 0
 
         for seq in range(0, (len(img) + CHUNK_DATA - 1) // CHUNK_DATA):
             if args.stop_after is not None and seq >= args.stop_after:
@@ -70,6 +75,7 @@ def main():
             if got is None or got[0] != fr.MSG_ACK:
                 print("chunk %d -> %s" % (seq, fr.describe(got)))
                 return 1
+            nbytes += len(data)
 
             if args.dup is not None and seq == args.dup:
                 got = send_chunk(ser, seq, data)
@@ -79,7 +85,8 @@ def main():
                     return 1
 
         dt = time.monotonic() - t0
-        print("streamed in %.2f s" % dt)
+        print("streamed %d B in %.2f s (%.1f KB/s)"
+              % (nbytes, dt, nbytes / dt / 1024.0 if dt > 0 else 0.0))
 
         ser.write(fr.build(fr.MSG_END))
         got = fr.read_frame(ser)

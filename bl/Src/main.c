@@ -128,6 +128,13 @@ static void g4b_can_tx_bytes(const uint8_t *p, uint32_t len)
     p += n;
     len -= n;
   }
+  /* Same issue as the UART TC wait: queued is not transmitted, and
+     BOOT's ACK is followed by NVIC_SystemReset(). Bounded, unlike the
+     UART wait -- an unACKed CAN frame retries forever on a deaf bus,
+     and a spin on that would hang the bootloader. */
+  uint32_t t0 = HAL_GetTick();
+  while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) < 3u &&
+         HAL_GetTick() - t0 < 10u) { }
 }
 
 /* Arm the independent watchdog: ~5 s at LSI/256. */
