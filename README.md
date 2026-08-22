@@ -1,9 +1,10 @@
 # G4Boot
 
 A/B firmware-update bootloader for STM32G431KB (NUCLEO-G431KB), 16 KB.
-Firmware arrives over UART into the inactive slot, is verified from flash,
-booted under a 5 s watchdog, and must confirm itself; otherwise the previous
-firmware is restored automatically in ~25 s.
+Firmware arrives over UART, or over CAN as a UDS (ISO 14229) programming
+sequence, into the inactive slot, is verified from flash, booted under a 5 s
+watchdog, and must confirm itself; otherwise the previous firmware is
+restored automatically in ~25 s.
 
 All numbers measured on hardware. All failure paths exercised, including a
 deliberately defective image left to roll back unattended.
@@ -104,9 +105,38 @@ booting slot A
 read back as a log: activation request, three counted attempts, pending
 cleared.
 
+## Update over CAN (UDS)
+
+The same update runs as a UDS (ISO 14229) programming sequence: ISO-TP
+(ISO 15765-2) transport on 11-bit IDs `0x7E0`/`0x7E8`, 500 kbit/s classic
+CAN, SN65HVD230 transceiver on FDCAN1 (PA11/PA12), CANable 2.0 (slcan) as
+the host adapter. Each UART frame has a UDS equivalent, enforcing the same
+rules:
+
+- `0x34` RequestDownload: address must equal the inactive slot base, any
+  other address refused (NRC `0x31`) before the erase; `0x78`
+  responsePending covers the 570 ms erase
+- `0x36` TransferData: 512 B blocks with a block sequence counter; a
+  repeated counter is re-acknowledged without programming, the same ECC
+  rule as the UART retry
+- `0x37` RequestTransferExit: re-read the slot from flash, boot-time
+  validation
+- `0x11` ECUReset: records pending and resets, arming the same gamble as
+  BOOT
+
+Plus `0x10` session control and `0x3E` TesterPresent; violations answered
+with proper NRCs (wrong session `0x7F`, wrong sequence `0x24`, wrong
+counter `0x73`). Host is `tools/uds_update.py` (udsoncan + python-can-isotp).
+The rollback demonstration was repeated over CAN: same defective image,
+three counted attempts, unattended return to the previous firmware.
+
+Honestly absent: `0x27` SecurityAccess. A real ECU gates programming behind
+a seed/key exchange; here any node on the bus can flash the board. This is
+the CRC-vs-signature limitation restated at the protocol level.
+
 ## Measurements
 
-170 MHz, `-Og`, 115200 baud:
+170 MHz, 115200 baud:
 
 | quantity                         | value                    |
 |----------------------------------|--------------------------|
@@ -116,27 +146,44 @@ cleared.
 | END verification (hardware CRC)  | < 10 ms                  |
 | update, BEGIN to new app banner  | ~6 s (~8 s to confirmed) |
 | rollback, hang to previous app   | ~25 s, unattended        |
-| bootloader size                  | 12236 B of 16384 (74.7%) |
+| bootloader size                  | 13064 B of 16384 (79.7%) |
+
+Same 14096 B image over every transport, 500 kbit/s classic CAN, measured
+the same day on the same board:
+
+| transport                          | transfer     |
+|------------------------------------|--------------|
+| UART, 115200 baud                  | 9.2 KB/s     |
+| CAN, raw byte pipe                 | 21.0 KB/s    |
+| CAN, ISO-TP carrying G4B frames    | 15.3 KB/s    |
+| CAN, UDS with 512 B blocks         | 20.6 KB/s    |
+
+UDS nearly recovers the raw rate because fatter blocks amortize the
+per-message flow-control round trip: one FC per 512 B instead of one per
+264 B.
 
 Fitting 16 KB required: `vsnprintf` -> minimal formatter (saved 2.3 KB), HAL
 UART -> direct register access (saved 4.1 KB; `HAL_UART_Init` anchors helpers
-`--gc-sections` cannot discard).
+`--gc-sections` cannot discard), `-Og` -> `-Os` (saved 2.2 KB, regression-
+tested on hardware before any new code rode on it).
 
 ## Build and usage
 
-Requires `arm-none-eabi-gcc` (tested 15.3.rel1), `st-flash`, Python 3 +
-`pyserial` in a venv.
+Requires `arm-none-eabi-gcc` (tested 15.3.rel1), `st-flash`, Python 3 in a
+venv with `pyserial`; for CAN also `python-can`, `can-isotp`, `udsoncan`.
 
 ```
 make images                 # bootloader, both app variants, packed .img files
 st-flash --reset write bl/build/bl.bin 0x08000000
 st-flash --reset write app_a.img 0x08005000        # initial firmware, by wire
 
-.venv/bin/python tools/update.py PORT app_b.img --boot     # all later updates, by UART
+.venv/bin/python tools/update.py PORT app_b.img --boot         # update by UART
+.venv/bin/python tools/uds_update.py CANPORT app_b.img --reset # same update by CAN/UDS
 ```
 
-Also in `tools/`: `hello.py` (framing test, `--corrupt` proves CRC rejection),
-`begin.py` (erase timing), `pack.py --info`, `g4b_frame.py` (single shared
+Also in `tools/`: `hello.py` (framing test, `--corrupt` proves CRC rejection,
+`--can` runs it over ISO-TP), `begin.py` (erase timing), `canecho.py` (bus
+bring-up echo node), `pack.py --info`, `g4b_frame.py` (single shared
 wire-format implementation).
 
 ## Repository layout
@@ -145,12 +192,13 @@ wire-format implementation).
 bl/        bootloader (CubeMX project; most HAL removed)
 app/       one app source, linked twice via app_a.ld / app_b.ld
 shared/    image_header.h, g4b_proto.h, g4b_state.[ch], compiled into all three targets
-tools/     pack.py, check_map.py, update.py, g4b_frame.py, ...
+tools/     pack.py, check_map.py, update.py, uds_update.py, g4b_frame.py, ...
 ```
 
 ## Limitations
 
-- CRC-32 is integrity, not authenticity: no image signing, any host with UART
-  access can update the board
-- UART only; framing is transport-agnostic, FDCAN planned second
+- CRC-32 is integrity, not authenticity: no image signing, no `0x27`
+  SecurityAccess; any node with UART or bus access can update the board
+- classic CAN only: the SN65HVD230 tops out at 1 Mbit/s, so no FD bit-rate
+  switching on this bench
 - bench project: numbers describe this board, not a product
