@@ -23,7 +23,7 @@ PACK    = python3 tools/pack.py
 
 VERSION ?= 0.1.0
 
-.PHONY: all check bl app_a app_b app_b_bad images info sizes clean
+.PHONY: all check bl app_a app_b app_a_bad app_b_bad images info sizes clean
 
 all: images
 
@@ -46,6 +46,11 @@ app_b: check
 
 # Boots, prints, then hangs: never kicks, never confirms. Valid by every
 # byte-level check -- its defect exists only at runtime. IWDG test fodder.
+app_a_bad: check
+	$(MAKE_APP) TARGET=app_a_bad BUILD_DIR=build/bad_a LDSCRIPT=app_a.ld EXTRA_CFLAGS=-DG4B_SIMULATE_HANG
+	$(OBJCOPY) -O binary -S app/build/bad_a/app_a_bad.elf app/build/bad_a/app_a_bad.bin
+	$(PACK) app/build/bad_a/app_a_bad.bin --slot A --version 0.1.1 -o app_a_bad.img
+
 app_b_bad: check
 	$(MAKE_APP) TARGET=app_b_bad BUILD_DIR=build/bad LDSCRIPT=app_b.ld EXTRA_CFLAGS=-DG4B_SIMULATE_HANG
 	$(OBJCOPY) -O binary -S app/build/bad/app_b_bad.elf app/build/bad/app_b_bad.bin
