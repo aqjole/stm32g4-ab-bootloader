@@ -93,49 +93,58 @@ def open_port(port, baud=115200, timeout=1.0):
     return serial.Serial(port, baud, timeout=timeout)
 
 
-CAN_ID_HOST2DEV = 0x100
-CAN_ID_DEV2HOST = 0x101
+CAN_ID_HOST2DEV = 0x7E0        # tester -> ECU, the classic UDS pair
+CAN_ID_DEV2HOST = 0x7E8        # response id = request id + 8
 
 
-class CanPipe:
-    """A python-can bus dressed as a pyserial port: read(n) / write(b).
+class IsotpPipe:
+    """ISO-TP (ISO 15765-2) over the slcan adapter, dressed as a serial port.
 
-    The device-side shim, mirrored: bytes out ride 0x100 frames of up to
-    8 bytes; bytes in are the data of 0x101 frames, concatenated. read()
-    matches pyserial semantics -- waits up to `timeout`, may return fewer
-    than n bytes.
+    write() sends one ISO-TP message; the can-isotp stack handles SF/FF/CF
+    and obeys the device's flow control. read(n) hands out received message
+    bytes with pyserial semantics -- waits up to `timeout`, may return fewer.
     """
 
     def __init__(self, channel, bitrate=500000, timeout=1.0):
         try:
             import can
+            import isotp
         except ImportError:
-            sys.exit("error: python-can missing. Run:\n"
-                     "  .venv/bin/pip install python-can")
-        self._can = can
+            sys.exit("error: python-can or can-isotp missing. Run:\n"
+                     "  .venv/bin/pip install python-can can-isotp")
+        # default sleep_after_open is a hard 2 s, for adapters that reboot
+        # on serial open; the CANable does not, and 2 s eats most of the
+        # bootloader's 3 s listening window
         self.bus = can.Bus(interface="slcan", channel=channel,
-                           bitrate=bitrate)
+                           bitrate=bitrate, sleep_after_open=0.3)
+        addr = isotp.Address(isotp.AddressingMode.Normal_11bits,
+                             txid=CAN_ID_HOST2DEV, rxid=CAN_ID_DEV2HOST)
+        self.stack = isotp.CanStack(bus=self.bus, address=addr,
+                                    params={"stmin": 0, "blocksize": 0,
+                                            "rx_flowcontrol_timeout": 1000,
+                                            "rx_consecutive_frame_timeout": 1000})
         self.timeout = timeout
         self._buf = bytearray()
 
     def write(self, data):
-        for i in range(0, len(data), 8):
-            self.bus.send(self._can.Message(arbitration_id=CAN_ID_HOST2DEV,
-                                            data=data[i:i + 8],
-                                            is_extended_id=False))
+        import time
+        self.stack.send(bytes(data))
+        deadline = time.monotonic() + 5.0
+        # no sleep: process() paces itself off the device's STmin (0 here),
+        # and any sleep multiplied by ~37 CFs per chunk caps the throughput
+        while self.stack.transmitting() and time.monotonic() < deadline:
+            self.stack.process()
 
     def read(self, n=1):
         import time
         deadline = time.monotonic() + self.timeout
-        while len(self._buf) < n:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            msg = self.bus.recv(timeout=remaining)
-            if msg is None:
-                continue
-            if msg.arbitration_id == CAN_ID_DEV2HOST and not msg.is_error_frame:
-                self._buf.extend(msg.data)
+        while len(self._buf) < n and time.monotonic() < deadline:
+            self.stack.process()
+            msg = self.stack.recv()
+            if msg is not None:
+                self._buf.extend(msg)
+            else:
+                time.sleep(0.0005)
         out = bytes(self._buf[:n])
         del self._buf[:n]
         return out
@@ -148,4 +157,4 @@ class CanPipe:
 
 
 def open_can(channel, bitrate=500000, timeout=1.0):
-    return CanPipe(channel, bitrate, timeout)
+    return IsotpPipe(channel, bitrate, timeout)

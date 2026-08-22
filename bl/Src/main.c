@@ -79,8 +79,8 @@ static void g4b_tx_bytes(const uint8_t *p, uint32_t len)
 
 /* --- CAN <-> byte-stream shim --------------------------------------------
    Parcels in, bytes out. Logs stay UART-only. */
-#define G4B_CAN_ID_HOST2DEV  0x100u
-#define G4B_CAN_ID_DEV2HOST  0x101u
+#define G4B_CAN_ID_HOST2DEV  0x7E0u   /* tester -> ECU, the classic UDS pair */
+#define G4B_CAN_ID_DEV2HOST  0x7E8u   /* response id = request id + 8        */
 
 /* 512 B cannot overflow: the host waits for an ACK after every protocol
    frame (max 264 B). Indices are free-running u16 with wrap by mask; */
@@ -89,6 +89,44 @@ static uint16_t g4b_can_head;
 static uint16_t g4b_can_tail;
 static bool     g4b_byte_was_can;   /* source of the last byte returned   */
 static bool     g4b_reply_via_can;  /* latched when a valid frame lands   */
+
+/* ISO-TP receive state: a message in progress between FF and last CF */
+static uint16_t g4b_itp_expected;   /* payload bytes still to come        */
+static uint8_t  g4b_itp_seq;        /* next CF sequence number, 0..15     */
+/* last Flow Control seen, for the TX side's wait */
+static uint8_t  g4b_itp_fc[3];
+static bool     g4b_itp_fc_fresh;
+
+static void g4b_can_send(const uint8_t *d, uint32_t n)
+{
+  FDCAN_TxHeaderTypeDef h = {0};
+  h.Identifier = G4B_CAN_ID_DEV2HOST;
+  h.IdType = FDCAN_STANDARD_ID;
+  h.TxFrameType = FDCAN_DATA_FRAME;
+  h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  h.BitRateSwitch = FDCAN_BRS_OFF;
+  h.FDFormat = FDCAN_CLASSIC_CAN;
+  h.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  h.DataLength = n;
+
+  while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0u) { }
+  HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, d);
+}
+
+static void g4b_ring_put(const uint8_t *d, uint32_t n)
+{
+  for (uint32_t i = 0u; i < n; i++) {
+    g4b_can_ring[g4b_can_head++ & 511u] = d[i];
+  }
+}
+
+static void g4b_itp_send_fc(uint8_t status)   /* 0 = CTS, 2 = overflow */
+{
+  /* BS 0 = no block limit, STmin 0 = no gap: the ring plus lockstep
+     protocol above make throttling unnecessary on this side */
+  uint8_t fc[3] = {(uint8_t)(0x30u | status), 0u, 0u};
+  g4b_can_send(fc, 3u);
+}
 
 /* Drain the peripheral's 3-deep RX FIFO into the ring. */
 static void g4b_can_pump(void)
@@ -100,33 +138,98 @@ static void g4b_can_pump(void)
     if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &h, d) != HAL_OK) {
       return;
     }
-    if (h.Identifier != G4B_CAN_ID_HOST2DEV) { continue; }
-    for (uint32_t i = 0u; i < h.DataLength; i++) {
-      g4b_can_ring[g4b_can_head++ & 511u] = d[i];
+    if (h.Identifier != G4B_CAN_ID_HOST2DEV || h.DataLength == 0u) { continue; }
+
+    uint8_t pci = d[0] >> 4;
+
+    if (pci == 0x0u) {                  /* Single Frame: whole message     */
+      uint8_t n = d[0] & 0x0Fu;
+      if (n == 0u || n > h.DataLength - 1u) { continue; }
+      g4b_ring_put(&d[1], n);
+      g4b_itp_expected = 0u;            /* SF aborts any half-done message */
+
+    } else if (pci == 0x1u) {           /* First Frame: opens a long one   */
+      uint16_t total = (uint16_t)((d[0] & 0x0Fu) << 8) | d[1];
+      if (total <= 7u || h.DataLength < 8u) { continue; }
+      if (total > sizeof g4b_can_ring - 1u) {
+        g4b_itp_send_fc(2u);            /* overflow: refuse BEFORE the CFs */
+        continue;
+      }
+      g4b_ring_put(&d[2], 6u);
+      g4b_itp_expected = total - 6u;
+      g4b_itp_seq = 1u;
+      g4b_itp_send_fc(0u);              /* clear to send */
+
+    } else if (pci == 0x2u) {           /* Consecutive Frame               */
+      if (g4b_itp_expected == 0u) { continue; }
+      if ((d[0] & 0x0Fu) != g4b_itp_seq) {
+        g4b_itp_expected = 0u;
+        continue;
+      }
+      g4b_itp_seq = (g4b_itp_seq + 1u) & 0x0Fu;
+      uint32_t n = (g4b_itp_expected < 7u) ? g4b_itp_expected : 7u;
+      if (n > (uint32_t)h.DataLength - 1u) { n = (uint32_t)h.DataLength - 1u; }
+      g4b_ring_put(&d[1], n);
+      g4b_itp_expected -= (uint16_t)n;
+
+    } else {                            /* Flow Control: stash for TX side */
+      g4b_itp_fc[0] = d[0];
+      g4b_itp_fc[1] = (h.DataLength > 1u) ? d[1] : 0u;
+      g4b_itp_fc[2] = (h.DataLength > 2u) ? d[2] : 0u;
+      g4b_itp_fc_fresh = true;
     }
   }
 }
 
 static void g4b_can_tx_bytes(const uint8_t *p, uint32_t len)
 {
-  FDCAN_TxHeaderTypeDef h = {0};
-  h.Identifier = G4B_CAN_ID_DEV2HOST;
-  h.IdType = FDCAN_STANDARD_ID;
-  h.TxFrameType = FDCAN_DATA_FRAME;
-  h.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  h.BitRateSwitch = FDCAN_BRS_OFF;
-  h.FDFormat = FDCAN_CLASSIC_CAN;
-  h.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  uint8_t f[8];
 
-  while (len > 0u) {
-    uint32_t n = (len > 8u) ? 8u : len;
-    h.DataLength = n;
-    while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0u) { }
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, p) != HAL_OK) {
-      return;
+  if (len <= 7u) {                      /* Single Frame */
+    f[0] = (uint8_t)len;
+    memcpy(&f[1], p, len);
+    g4b_can_send(f, len + 1u);
+  } else {                              /* FF, then FC gates the CFs */
+    f[0] = (uint8_t)(0x10u | (len >> 8));
+    f[1] = (uint8_t)len;
+    memcpy(&f[2], p, 6u);
+    g4b_can_send(f, 8u);
+    p += 6u;
+    len -= 6u;
+
+    uint8_t seq = 1u;
+    uint8_t bs = 0u;
+    uint8_t stmin = 0u;
+    uint32_t in_block = 0u;
+    bool need_fc = true;
+
+    while (len > 0u) {
+      if (need_fc) {
+        g4b_itp_fc_fresh = false;
+        uint32_t t0 = HAL_GetTick();
+        while (!g4b_itp_fc_fresh && HAL_GetTick() - t0 < 1000u) {
+          g4b_can_pump();
+        }
+        if (!g4b_itp_fc_fresh || (g4b_itp_fc[0] & 0x0Fu) != 0u) { return; }
+        bs = g4b_itp_fc[1];
+        stmin = g4b_itp_fc[2];
+        /* 0xF1..F9 encode 100..900 us; rounding up to 1 ms is legal */
+        if (stmin > 0x7Fu) { stmin = 1u; }
+        need_fc = false;
+        in_block = 0u;
+      }
+
+      uint32_t n = (len < 7u) ? len : 7u;
+      f[0] = (uint8_t)(0x20u | seq);
+      memcpy(&f[1], p, n);
+      g4b_can_send(f, n + 1u);
+      seq = (seq + 1u) & 0x0Fu;
+      p += n;
+      len -= n;
+
+      if (stmin > 0u && len > 0u) { HAL_Delay(stmin); }
+      if (bs > 0u && ++in_block == bs && len > 0u) { need_fc = true; }
     }
-    p += n;
-    len -= n;
   }
   /* Same issue as the UART TC wait: queued is not transmitted, and
      BOOT's ACK is followed by NVIC_SystemReset(). Bounded, unlike the
