@@ -82,13 +82,23 @@ static void g4b_tx_bytes(const uint8_t *p, uint32_t len)
 #define G4B_CAN_ID_HOST2DEV  0x7E0u   /* tester -> ECU, the classic UDS pair */
 #define G4B_CAN_ID_DEV2HOST  0x7E8u   /* response id = request id + 8        */
 
-/* 512 B cannot overflow: the host waits for an ACK after every protocol
-   frame (max 264 B). Indices are free-running u16 with wrap by mask; */
-static uint8_t  g4b_can_ring[512];
-static uint16_t g4b_can_head;
-static uint16_t g4b_can_tail;
-static bool     g4b_byte_was_can;   /* source of the last byte returned   */
-static bool     g4b_reply_via_can;  /* latched when a valid frame lands   */
+/* ISO-TP reassembles whole messages here; a completed message is a UDS
+   request. */
+static uint8_t  g4b_uds_buf[520];
+static uint16_t g4b_uds_len;        /* reassembly write index            */
+static bool     g4b_uds_busy;       /* re-entry guard for the dispatcher */
+static void g4b_uds_handle(const uint8_t *m, uint16_t len);
+
+static uint8_t  g4b_uds_session = 1u;   /* 1 default, 2 programming      */
+static bool     g4b_uds_dl_open;
+static uint8_t  g4b_uds_bsc;            /* next expected block counter   */
+static uint32_t g4b_uds_slot;
+static uint32_t g4b_uds_off;
+static uint32_t g4b_uds_size;           /* announced total, header incl. */
+static bool     g4b_uds_active;         /* any valid request seen        */
+static uint32_t g4b_uds_last_ms;
+static const boot_state_t *g4b_uds_boot_st;
+static uint32_t g4b_uds_boot_stale;
 
 /* ISO-TP receive state: a message in progress between FF and last CF */
 static uint16_t g4b_itp_expected;   /* payload bytes still to come        */
@@ -113,10 +123,19 @@ static void g4b_can_send(const uint8_t *d, uint32_t n)
   HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &h, d);
 }
 
-static void g4b_ring_put(const uint8_t *d, uint32_t n)
+static void g4b_uds_put(const uint8_t *d, uint32_t n)
 {
-  for (uint32_t i = 0u; i < n; i++) {
-    g4b_can_ring[g4b_can_head++ & 511u] = d[i];
+  if ((uint32_t)g4b_uds_len + n > sizeof g4b_uds_buf) { return; }
+  memcpy(&g4b_uds_buf[g4b_uds_len], d, n);
+  g4b_uds_len += (uint16_t)n;
+}
+
+static void g4b_uds_complete(void)
+{
+  if (!g4b_uds_busy) {
+    g4b_uds_busy = true;
+    g4b_uds_handle(g4b_uds_buf, g4b_uds_len);
+    g4b_uds_busy = false;
   }
 }
 
@@ -145,17 +164,20 @@ static void g4b_can_pump(void)
     if (pci == 0x0u) {                  /* Single Frame: whole message     */
       uint8_t n = d[0] & 0x0Fu;
       if (n == 0u || n > h.DataLength - 1u) { continue; }
-      g4b_ring_put(&d[1], n);
+      g4b_uds_len = 0u;
+      g4b_uds_put(&d[1], n);
       g4b_itp_expected = 0u;            /* SF aborts any half-done message */
+      g4b_uds_complete();
 
     } else if (pci == 0x1u) {           /* First Frame: opens a long one   */
       uint16_t total = (uint16_t)((d[0] & 0x0Fu) << 8) | d[1];
       if (total <= 7u || h.DataLength < 8u) { continue; }
-      if (total > sizeof g4b_can_ring - 1u) {
+      if (total > sizeof g4b_uds_buf) {
         g4b_itp_send_fc(2u);            /* overflow: refuse BEFORE the CFs */
         continue;
       }
-      g4b_ring_put(&d[2], 6u);
+      g4b_uds_len = 0u;
+      g4b_uds_put(&d[2], 6u);
       g4b_itp_expected = total - 6u;
       g4b_itp_seq = 1u;
       g4b_itp_send_fc(0u);              /* clear to send */
@@ -169,8 +191,9 @@ static void g4b_can_pump(void)
       g4b_itp_seq = (g4b_itp_seq + 1u) & 0x0Fu;
       uint32_t n = (g4b_itp_expected < 7u) ? g4b_itp_expected : 7u;
       if (n > (uint32_t)h.DataLength - 1u) { n = (uint32_t)h.DataLength - 1u; }
-      g4b_ring_put(&d[1], n);
+      g4b_uds_put(&d[1], n);
       g4b_itp_expected -= (uint16_t)n;
+      if (g4b_itp_expected == 0u) { g4b_uds_complete(); }
 
     } else {                            /* Flow Control: stash for TX side */
       g4b_itp_fc[0] = d[0];
@@ -323,11 +346,7 @@ static void g4b_frame_send(uint8_t type, const void *payload, uint16_t len)
   g4b_tx[4u + len + 2u] = (uint8_t)(crc >> 16);
   g4b_tx[4u + len + 3u] = (uint8_t)(crc >> 24);
 
-  if (g4b_reply_via_can) {
-    g4b_can_tx_bytes(g4b_tx, 8u + len);
-  } else {
-    g4b_tx_bytes(g4b_tx, 8u + len);
-  }
+  g4b_tx_bytes(g4b_tx, 8u + len);
 }
 
 static uint8_t  g4b_rx[3u + G4B_MAX_PAYLOAD];
@@ -346,17 +365,10 @@ static bool g4b_rx_byte(uint8_t *b, uint32_t ms)
     }
     if (USART2->ISR & USART_ISR_RXNE) {
       *b = (uint8_t)USART2->RDR;          /* reading RDR clears RXNE */
-      g4b_byte_was_can = false;
       return true;
     }
 
     g4b_can_pump();
-
-    if (g4b_can_tail != g4b_can_head) {
-      *b = g4b_can_ring[g4b_can_tail++ & 511u];
-      g4b_byte_was_can = true;
-      return true;
-    }
     if ((HAL_GetTick() - start) >= ms) { return false; }
   }
 }
@@ -405,7 +417,6 @@ static g4b_rx_result_t g4b_frame_recv(uint32_t timeout_ms)
 
     g4b_rx_len  = len;
     g4b_rx_type = g4b_rx[2];
-    g4b_reply_via_can = g4b_byte_was_can;
     return G4B_RX_OK;
   }
 
@@ -705,6 +716,149 @@ static void g4b_handle_boot(const boot_state_t *st, uint32_t stale)
   NVIC_SystemReset();
 }
 
+/* --- UDS server (ISO 14229), the six services of a programming session --- */
+static void g4b_uds_nrc(uint8_t sid, uint8_t code)
+{
+  uint8_t r[3] = {0x7Fu, sid, code};
+  g4b_can_tx_bytes(r, 3u);
+}
+
+static void g4b_uds_handle(const uint8_t *m, uint16_t len)
+{
+  if (len == 0u) { return; }
+  g4b_uds_active  = true;
+  g4b_uds_last_ms = HAL_GetTick();
+
+  const boot_state_t *st = g4b_uds_boot_st;
+  uint8_t sid = m[0];
+
+  switch (sid) {
+  case 0x10u: {                             /* DiagnosticSessionControl */
+    if (len != 2u) { g4b_uds_nrc(sid, 0x13u); return; }
+    if (m[1] != 1u && m[1] != 2u) { g4b_uds_nrc(sid, 0x12u); return; }
+    g4b_uds_session = m[1];
+    g4b_uds_dl_open = false;
+    /* sessionParameterRecord: P2 = 50 ms, P2* = 5000 ms (in 10 ms units) */
+    uint8_t r[6] = {0x50u, m[1], 0x00u, 0x32u, 0x01u, 0xF4u};
+    g4b_can_tx_bytes(r, 6u);
+    break;
+  }
+
+  case 0x3Eu: {                             /* TesterPresent */
+    if (len != 2u) { g4b_uds_nrc(sid, 0x13u); return; }
+    if ((m[1] & 0x7Fu) != 0u) { g4b_uds_nrc(sid, 0x12u); return; }
+    if ((m[1] & 0x80u) == 0u) {             /* bit 7 = suppress response */
+      uint8_t r[2] = {0x7Eu, 0x00u};
+      g4b_can_tx_bytes(r, 2u);
+    }
+    break;
+  }
+
+  case 0x34u: {                             /* RequestDownload */
+    if (g4b_uds_session != 2u) { g4b_uds_nrc(sid, 0x7Fu); return; }
+    if (len != 11u) { g4b_uds_nrc(sid, 0x13u); return; }
+    if (m[1] != 0x00u || m[2] != 0x44u) { g4b_uds_nrc(sid, 0x31u); return; }
+
+    uint32_t addr = ((uint32_t)m[3] << 24) | ((uint32_t)m[4] << 16)
+                  | ((uint32_t)m[5] << 8)  |  (uint32_t)m[6];
+    uint32_t size = ((uint32_t)m[7] << 24) | ((uint32_t)m[8] << 16)
+                  | ((uint32_t)m[9] << 8)  |  (uint32_t)m[10];
+
+    uint32_t want = (st->active == G4B_SLOT_B) ? G4B_SLOT_A_BASE
+                                               : G4B_SLOT_B_BASE;
+    /* position is part of validity: only the inactive slot base is
+       writable */
+    if (addr != want ||
+        size <= G4B_HDR_RESERVED || (size % 8u) != 0u ||
+        size > G4B_HDR_RESERVED + G4B_APP_MAX_SIZE) {
+      g4b_uds_nrc(sid, 0x31u);
+      return;
+    }
+
+    g4b_uds_nrc(sid, 0x78u);                /* responsePending: erase ahead */
+    if (!g4b_slot_erase(addr)) { g4b_uds_nrc(sid, 0x72u); return; }
+
+    g4b_uds_slot = addr;
+    g4b_uds_size = size;
+    g4b_uds_off  = 0u;
+    g4b_uds_bsc  = 1u;
+    g4b_uds_dl_open = true;
+    /* maxNumberOfBlockLength 514 = 512 data + SID + counter */
+    uint8_t r[4] = {0x74u, 0x20u, 0x02u, 0x02u};
+    g4b_can_tx_bytes(r, 4u);
+    break;
+  }
+
+  case 0x36u: {                             /* TransferData */
+    if (!g4b_uds_dl_open) { g4b_uds_nrc(sid, 0x24u); return; }
+    uint32_t data = (uint32_t)len - 2u;
+    if (len < 10u || (data % 8u) != 0u) { g4b_uds_nrc(sid, 0x13u); return; }
+
+    if (m[1] == (uint8_t)(g4b_uds_bsc - 1u)) {
+      uint8_t r[2] = {0x76u, m[1]};         /* duplicate: receipt only, the
+                                               flash was already touched   */
+      g4b_can_tx_bytes(r, 2u);
+      return;
+    }
+    if (m[1] != g4b_uds_bsc) {
+      g4b_uds_dl_open = false;
+      g4b_uds_nrc(sid, 0x73u);
+      return;
+    }
+    if (g4b_uds_off + data > g4b_uds_size) {
+      g4b_uds_dl_open = false;
+      g4b_uds_nrc(sid, 0x31u);
+      return;
+    }
+    if (!g4b_flash_write(g4b_uds_slot + g4b_uds_off, &m[2], data)) {
+      g4b_uds_dl_open = false;
+      g4b_uds_nrc(sid, 0x72u);
+      return;
+    }
+    g4b_uds_off += data;
+    uint8_t r[2] = {0x76u, g4b_uds_bsc};
+    g4b_uds_bsc++;                          /* u8 wrap 0xFF -> 0x00 is spec */
+    g4b_can_tx_bytes(r, 2u);
+    break;
+  }
+
+  case 0x37u: {                             /* RequestTransferExit */
+    if (!g4b_uds_dl_open) { g4b_uds_nrc(sid, 0x24u); return; }
+    g4b_uds_dl_open = false;
+    if (len != 1u) { g4b_uds_nrc(sid, 0x13u); return; }
+    if (g4b_uds_off != g4b_uds_size || !g4b_slot_valid(g4b_uds_slot)) {
+      g4b_uds_nrc(sid, 0x72u);
+      return;
+    }
+    uint8_t r[1] = {0x77u};
+    g4b_can_tx_bytes(r, 1u);
+    break;
+  }
+
+  case 0x11u: {                             /* ECUReset: the gamble */
+    if (len != 2u) { g4b_uds_nrc(sid, 0x13u); return; }
+    if (m[1] != 1u) { g4b_uds_nrc(sid, 0x12u); return; }
+    uint8_t target = (st->active == G4B_SLOT_B) ? G4B_SLOT_A : G4B_SLOT_B;
+    if (!g4b_slot_valid(g4b_slot_base(target)) ||
+        !g4b_state_write(g4b_uds_boot_stale, st->active, target, 0u,
+                         st->confirmed, st->seq + 1u)) {
+      g4b_uds_nrc(sid, 0x22u);              /* conditionsNotCorrect */
+      return;
+    }
+    g4b_printf("pending=%s -- resetting (uds)\r\n",
+               (target == G4B_SLOT_B) ? "B" : "A");
+    uint8_t r[2] = {0x51u, 0x01u};
+    g4b_can_tx_bytes(r, 2u);                /* drain wait guarantees escape */
+    NVIC_SystemReset();
+    break;
+  }
+
+  default:
+    g4b_uds_nrc(sid, 0x11u);                /* serviceNotSupported */
+    break;
+  }
+}
+
 /* Hand control to the image in `slot_base`. Never returns. */
 __attribute__((noreturn))
 static void g4b_jump_to_slot(uint32_t slot_base)
@@ -818,41 +972,48 @@ int main(void)
     }
   }
 
+  g4b_uds_boot_st    = &st;
+  g4b_uds_boot_stale = stale;
+
   g4b_printf("listening for a frame (3 s)\r\n");
   g4b_rx_result_t r = g4b_frame_recv(3000u);
 
-  if (r == G4B_RX_OK) {
+  if (r == G4B_RX_OK || g4b_uds_active) {
     g4b_printf("update mode -- not booting\r\n");
 
     for (;;) {
-      switch (g4b_rx_type) {
-      case G4B_MSG_HELLO:
-        g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
-        break;
+      if (r == G4B_RX_OK) {
+        switch (g4b_rx_type) {
+        case G4B_MSG_HELLO:
+          g4b_frame_send(G4B_MSG_ACK, NULL, 0u);
+          break;
 
-      case G4B_MSG_BEGIN:
-        g4b_handle_begin(&st);
-        break;
+        case G4B_MSG_BEGIN:
+          g4b_handle_begin(&st);
+          break;
 
-      case G4B_MSG_CHUNK:
-        g4b_handle_chunk();
-        break;
+        case G4B_MSG_CHUNK:
+          g4b_handle_chunk();
+          break;
 
-      case G4B_MSG_END:
-        g4b_handle_end();
-        break;      
-      case G4B_MSG_BOOT:
-        g4b_handle_boot(&st, stale);
-        break;
+        case G4B_MSG_END:
+          g4b_handle_end();
+          break;      
+        case G4B_MSG_BOOT:
+          g4b_handle_boot(&st, stale);
+          break;
 
-      default: {
-        uint8_t why = G4B_NACK_BAD_TYPE;
-        g4b_frame_send(G4B_MSG_NACK, &why, 1u);
-        break;
+        default: {
+          uint8_t why = G4B_NACK_BAD_TYPE;
+          g4b_frame_send(G4B_MSG_NACK, &why, 1u);
+          break;
+        }
+        }
       }
-      }
 
-      if (g4b_frame_recv(30000u) != G4B_RX_OK) {
+      r = g4b_frame_recv(30000u);
+      if (r != G4B_RX_OK &&
+          (HAL_GetTick() - g4b_uds_last_ms) >= 30000u) {
         g4b_printf("host gone -- resetting\r\n");
         NVIC_SystemReset();
       }
